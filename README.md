@@ -1,60 +1,201 @@
 # qvac-chatterbox.cpp
 
-Chatterbox Turbo speech synthesis (Resemble AI, MIT) ported to
-[`ggml`](https://github.com/ggml-org/ggml). See [`PROGRESS.md`](PROGRESS.md)
-for the full development journal.
+**Chatterbox Turbo** (Resemble AI, MIT-licensed zero-shot text-to-speech)
+ported to [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference
+on CPU (Linux/macOS) with no runtime dependency on Python or PyTorch.
 
-## Layout
+See [`PROGRESS.md`](PROGRESS.md) for the full chronological development
+journal, including verification stages, numerical parity results, and the
+optimization pass that got us to **3.6× faster than real-time on CPU**.
+
+---
+
+## Pipeline at a glance
 
 ```
-qvac-chatterbox.cpp/
-  ggml/                    ← pristine ggml clone (not tracked in git)
-  src/
-    main.cpp               T3 ggml runner
-    gpt2_bpe.{h,cpp}       self-contained GPT-2 BPE tokenizer
-    test_s3gen.cpp         staged S3Gen verification harness
-    npy.h                  minimal .npy loader
-  scripts/
-    convert-t3-turbo-to-gguf.py
-    convert-s3gen-to-gguf.py
-    dump-s3gen-reference.py
-    reference-t3-turbo.py
-    compare-tokenizer.py
-  models/                  GGUF weights (generated, not tracked)
-  CMakeLists.txt
+      text                                                  24 kHz wav
+       │                                                         ▲
+       ▼                                                         │
+  ┌────────────┐     speech tokens      ┌──────────────────────────────┐
+  │ chatterbox │ ─────────────────────► │ chatterbox-tts               │
+  │  (T3)      │      (int32, 6561      │  S3Gen encoder               │
+  │            │       vocab)           │  + CFM 2-step meanflow       │
+  └────────────┘                        │  + HiFT vocoder (mel → wav)  │
+       ▲                                 └──────────────────────────────┘
+       │                                               ▲
+    BPE tokenizer                               reference voice
+    (vocab.json, merges.txt)                    (embedding / prompt tokens / prompt feat)
 ```
 
-## Setup
+`scripts/synthesize.sh` chains the two binaries into a single `text → wav`
+command.
 
-Clone `ggml` alongside this repo:
+## Prerequisites
+
+- C++17 compiler (clang or gcc)
+- cmake ≥ 3.14
+- Python 3.10+ with `torch`, `numpy`, `gguf`, `safetensors`, `scipy` —
+  needed **once** for the weight conversion and the reference-voice dump.
+
+The easiest way to get the Python side is:
 
 ```bash
+git clone https://github.com/resemble-ai/chatterbox.git chatterbox-ref
+cd chatterbox-ref
+python -m venv .venv && . .venv/bin/activate
+pip install -e .
+pip install gguf safetensors scipy
+cd -
+```
+
+## 1. Clone and build
+
+```bash
+# (from wherever you want the repo to live)
+git clone git@github.com:gianni-cor/chatterbox.cpp.git
+cd chatterbox.cpp
+
+# ggml is vendored as a sibling subdirectory
 git clone https://github.com/ggml-org/ggml.git ggml
+
+# Build all 4 binaries: chatterbox, chatterbox-tts, mel2wav, test-s3gen
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
 
-## Build
+This produces:
+
+| Binary | What it does |
+|--------|--------------|
+| `build/chatterbox` | T3: text → speech tokens |
+| `build/chatterbox-tts` | S3Gen + HiFT: speech tokens → 24 kHz wav |
+| `build/mel2wav` | HiFT only: mel.npy → wav (demo) |
+| `build/test-s3gen` | Staged numerical validation vs Python dumps |
+
+## 2. One-time: convert weights and dump the reference voice
 
 ```bash
-cmake -S . -B build
-cmake --build build -j
-```
+# Activate the Python environment from the Prerequisites step
+. ../chatterbox-ref/.venv/bin/activate
 
-## Convert
-
-```bash
+# Convert T3 weights + built-in voice conditionals
 python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
+
+# Convert S3Gen encoder + CFM + HiFT weights
+python scripts/convert-s3gen-to-gguf.py --out models/chatterbox-s3gen.gguf
+
+# Dump the built-in reference voice (speaker embedding, prompt tokens, prompt mel)
+# as .npy files — chatterbox-tts needs these as the "ref_dir".
+python scripts/dump-s3gen-reference.py \
+  --text "Hello from ggml." \
+  --out artifacts/s3gen-ref \
+  --seed 42 --n-predict 64 --device cpu
 ```
 
-## Run
+The first two scripts pull `ResembleAI/chatterbox-turbo` from Hugging Face
+Hub on first run (about 1.5 GB). They also cache `vocab.json`, `merges.txt`,
+and `added_tokens.json` which the C++ tokenizer reads at runtime.
+
+You should now have:
+
+```
+models/
+  chatterbox-t3-turbo.gguf   (~730 MB, F16 T3 weights)
+  chatterbox-s3gen.gguf      (~410 MB, F32 S3Gen + HiFT weights)
+artifacts/s3gen-ref/
+  embedding.npy              (192,) speaker embedding
+  prompt_token.npy           (250,) reference voice speech tokens
+  prompt_feat.npy            (500, 80) reference mel
+  mel_output.npy             ... and many more (used by test-s3gen)
+```
+
+## 3. Run — end-to-end text → wav
+
+The easiest way:
 
 ```bash
+./scripts/synthesize.sh "Hello from native C plus plus." /tmp/out.wav
+```
+
+That wraps the two-binary pipeline:
+
+```bash
+# What synthesize.sh actually runs under the hood:
+
+TOKENIZER_DIR=~/.cache/huggingface/hub/models--ResembleAI--chatterbox-turbo/snapshots/*/
+
 ./build/chatterbox \
   --model models/chatterbox-t3-turbo.gguf \
-  --tokens-file text_tokens.txt \
-  --output speech_tokens.txt
+  --tokenizer-dir "$TOKENIZER_DIR" \
+  --text "Hello from native C plus plus." \
+  --output /tmp/tokens.txt
+
+./build/chatterbox-tts \
+  --s3gen-gguf models/chatterbox-s3gen.gguf \
+  --ref-dir artifacts/s3gen-ref \
+  --tokens-file /tmp/tokens.txt \
+  --out /tmp/out.wav
 ```
 
-## Compare with reference
+Play the result:
+
+```bash
+afplay /tmp/out.wav         # macOS
+aplay  /tmp/out.wav         # Linux (alsa)
+ffplay /tmp/out.wav         # any OS with ffmpeg
+```
+
+### Useful flags
+
+- `--seed N` — change the RNG seed for the CFM initial noise and the SineGen
+  excitation (same text, different voice "take").
+- `--threads N` — override the default `std::thread::hardware_concurrency()`
+  on `chatterbox-tts`. The sweet spot on a 10-core CPU is 10.
+- `--debug` — on `chatterbox-tts`, substitute Python-dumped reference values
+  for the random bits so every stage can be bit-exactly compared to PyTorch.
+
+Typical timings on a 10-core EPYC CPU:
+
+```
+>>> [1/2] T3: text -> speech tokens
+    generated 145 speech tokens
+>>> [2/2] S3Gen + HiFT: speech tokens -> wav
+Using 10 threads
+  [encoder] 286 ms
+  [cfm_total] 785 ms
+  [hift_total] 1312 ms
+=== pipeline: 2383 ms for 8640 ms of audio (RTF=0.28, 3.6x faster than real-time) ===
+```
+
+## 4. Optional: validate against PyTorch
+
+Every stage of the pipeline has a numerical regression test against
+Python-dumped reference tensors:
+
+```bash
+./build/test-s3gen models/chatterbox-s3gen.gguf artifacts/s3gen-ref ALL
+```
+
+Expected output (rel error per stage):
+
+```
+Stage A  speaker_emb_affine    rel ≈ 1e-7
+Stage B  input_embedded        rel = 0
+Stage C  encoder_embed         rel ≈ 4e-7
+Stage D  pre_lookahead         rel ≈ 3e-7
+Stage E  enc_block0_out        rel ≈ 1e-7
+Stage F  encoder_proj (mu)     rel ≈ 5e-7
+Stage G1 time_mixer            rel ≈ 7e-7
+Stage G2 cfm_resnet_out        rel ≈ 3e-7
+Stage G3 tfm_out               rel ≈ 2e-7
+Stage G4 cfm_step0_dxdt        rel ≈ 1e-6
+Stage H1 f0                    rel ≈ 4e-6
+Stage H3 conv_post             rel ≈ 6e-7
+Stage H4 stft                  rel ≈ 8e-3 (boundary-bound)
+Stage H5 waveform              rel ≈ 1e-4
+```
+
+For T3 bit-exact validation against the Python reference:
 
 ```bash
 python scripts/reference-t3-turbo.py \
@@ -63,3 +204,51 @@ python scripts/reference-t3-turbo.py \
   --cpp-bin ./build/chatterbox \
   --cpp-model models/chatterbox-t3-turbo.gguf
 ```
+
+## Repository layout
+
+```
+chatterbox.cpp/
+  ggml/                          pristine ggml clone (not tracked)
+  src/
+    main.cpp                     T3 runtime          (chatterbox)
+    chatterbox_tts.cpp           S3Gen + HiFT runtime (chatterbox-tts)
+    mel2wav.cpp                  HiFT-only demo       (mel2wav)
+    test_s3gen.cpp               staged validation    (test-s3gen)
+    gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer
+    npy.h                        minimal .npy loader + compare helpers
+  scripts/
+    synthesize.sh                text → wav wrapper
+    convert-t3-turbo-to-gguf.py  T3 weights + conds → GGUF
+    convert-s3gen-to-gguf.py     flow (encoder + CFM) + HiFT → GGUF
+    dump-s3gen-reference.py      PyTorch → .npy intermediates
+    reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
+    compare-tokenizer.py         10-case BPE tokenizer compare vs HF
+  models/                        generated GGUFs (not tracked)
+  artifacts/s3gen-ref/           generated .npy reference tensors (not tracked)
+  CMakeLists.txt                 top-level build: add_subdirectory(ggml) + 4 targets
+  README.md                      this file
+  PROGRESS.md                    chronological development journal
+```
+
+## Troubleshooting
+
+**`error: missing artifacts/s3gen-ref`** — run the
+`dump-s3gen-reference.py` step in §2. That directory currently contains the
+built-in reference voice used by `chatterbox-tts`.
+
+**`gpt2_bpe: failed to open .../vocab.json`** — the tokenizer dir points at
+the Hugging Face snapshot directory that contains `vocab.json`,
+`merges.txt`, and `added_tokens.json`. Either set
+`CHATTERBOX_TOKENIZER_DIR` before running `synthesize.sh`, or pass
+`--tokenizer-dir /path/to/dir` explicitly to `./build/chatterbox`.
+
+**Output is much louder than the Python reference** — expected: the Python
+reference dump uses a very short utterance (mostly silence). Generate a
+longer sentence and compare RMS. Differences up to ~2.5 % in spectrogram
+magnitude are from the stochastic SineGen excitation (non-bit-exact RNG
+between `std::mt19937` and `torch.rand`).
+
+**Slower than real-time** — make sure you built `-DCMAKE_BUILD_TYPE=Release`
+and that `--threads` picks up all your cores. `synthesize.sh` inherits
+defaults from `std::thread::hardware_concurrency()` via `chatterbox-tts`.
