@@ -474,21 +474,22 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
     ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
     ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
-    q = ggml_reshape_3d(ctx, q, HD, H, T);
-    k = ggml_reshape_3d(ctx, k, HD, H, T);
-    v = ggml_reshape_3d(ctx, v, HD, H, T);
-    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
-    ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
-    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
-    ggml_tensor * attn = ggml_soft_max(ctx, scores);
-    ggml_tensor * v_for_mm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));
-    ggml_tensor * attn_v = ggml_mul_mat(ctx, v_for_mm, attn);
-    ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3));
-    ggml_tensor * flat = ggml_reshape_2d(ctx, merged, INNER, T);
+    // (INNER, T) -> (HD, H, T) -> (HD, T, H) contiguous for flash-attn
+    q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, HD, H, T), 0, 2, 1, 3));
+    k = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, HD, H, T), 0, 2, 1, 3));
+    v = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v, HD, H, T), 0, 2, 1, 3));
+
+    // Fused softmax(QK^T / sqrt(HD)) @ V, streaming (no materialized T x T attn matrix).
+    // Output layout is (HD, H, T) internally ((D, H, N) per flash_attn_ext docs).
+    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
+                                                /*scale=*/1.0f / std::sqrt((float)HD),
+                                                /*max_bias=*/0.0f,
+                                                /*logit_softcap=*/0.0f);
+    // flash_attn_ext output: ne=[HD, H, T, 1] (contiguous). Reshape to (INNER, T).
+    ggml_tensor * flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
+
     ggml_tensor * nx2 = layer_norm(ctx, x, w.norm3_w, w.norm3_b);
     ggml_tensor * ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff0_w, nx2), w.ff0_b);
     ff = ggml_gelu_erf(ctx, ff);
@@ -801,8 +802,7 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
         ggml_tensor * w = find_tensor(m, pfx + "/weight");
         ggml_tensor * b = find_tensor(m, pfx + "/bias");
         int C_out = (int)w->ne[2];
-        ggml_tensor * xp = ggml_pad_ext(ctx, x, 1, 1, 0, 0, 0, 0, 0, 0);
-        x = conv1d_f32(ctx, w, xp, 1, 0, 1);
+        x = conv1d_f32(ctx, w, x, 1, 1, 1);
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
         x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
@@ -957,12 +957,10 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
             int pad1 = (ks * d - d) / 2;
             int pad2 = (ks - 1) / 2;
             ggml_tensor * xt = snake(ctx, x, p.a1, p.ia1);
-            xt = ggml_pad_ext(ctx, xt, pad1, pad1, 0, 0, 0, 0, 0, 0);
-            xt = conv1d_f32(ctx, p.c1w, xt, 1, 0, d);
+            xt = conv1d_f32(ctx, p.c1w, xt, 1, pad1, d);
             xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.c1b, 1, C));
             xt = snake(ctx, xt, p.a2, p.ia2);
-            xt = ggml_pad_ext(ctx, xt, pad2, pad2, 0, 0, 0, 0, 0, 0);
-            xt = conv1d_f32(ctx, p.c2w, xt, 1, 0, 1);
+            xt = conv1d_f32(ctx, p.c2w, xt, 1, pad2, 1);
             xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.c2b, 1, C));
             x = ggml_add(ctx, x, xt);
         }
@@ -971,8 +969,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
 
     ggml_tensor * cpw = find_tensor(m, "hift/conv_pre/weight");
     ggml_tensor * cpb = find_tensor(m, "hift/conv_pre/bias");
-    ggml_tensor * x = ggml_pad_ext(ctx, mel_in, 3, 3, 0, 0, 0, 0, 0, 0);
-    x = conv1d_f32(ctx, cpw, x, 1, 0, 1);
+    ggml_tensor * x = conv1d_f32(ctx, cpw, mel_in, 1, 3, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cpb, 1, BASE_CH));
 
     for (int i = 0; i < 3; ++i) {
@@ -991,8 +988,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
         ggml_tensor * sb = find_tensor(m, "hift/source_downs/" + std::to_string(i) + "/bias");
         int sd_stride = (i == 0) ? 15 : (i == 1) ? 3 : 1;
         int sd_pad    = (i == 0) ? 7  : (i == 1) ? 1 : 0;
-        ggml_tensor * sin_pad = ggml_pad_ext(ctx, s_in, sd_pad, sd_pad, 0, 0, 0, 0, 0, 0);
-        ggml_tensor * si = conv1d_f32(ctx, sw, sin_pad, sd_stride, 0, 1);
+        ggml_tensor * si = conv1d_f32(ctx, sw, s_in, sd_stride, sd_pad, 1);
         si = ggml_add(ctx, si, ggml_reshape_2d(ctx, sb, 1, (int)sw->ne[2]));
         auto srb = load_rb("hift/source_resblocks/" + std::to_string(i), ups_ch[i]);
         si = rb_fwd(srb, si, ups_ch[i], src_rb_dils[i], src_rb_ksizes[i]);
@@ -1010,8 +1006,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     x = ggml_leaky_relu(ctx, x, 0.01f, false);
     ggml_tensor * cp2w = find_tensor(m, "hift/conv_post/weight");
     ggml_tensor * cp2b = find_tensor(m, "hift/conv_post/bias");
-    x = ggml_pad_ext(ctx, x, 3, 3, 0, 0, 0, 0, 0, 0);
-    x = conv1d_f32(ctx, cp2w, x, 1, 0, 1);
+    x = conv1d_f32(ctx, cp2w, x, 1, 3, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp2b, 1, NFFT2));
 
     // ISTFT

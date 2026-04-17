@@ -369,40 +369,70 @@ initial noise/meanflow mels and the SineGen phase + additive noise.
 ### Timing (CPU only, 10-core EPYC)
 
 `-march=native` is already enabled by ggml (so AVX-512 / AVX-VNNI are used),
-but the first build used a single thread and no graph reuse. Two
-optimizations moved us decisively into faster-than-real-time territory:
+but the first build used a single thread, rebuilt every graph from scratch,
+and used the stock scaled-dot-product attention. Four optimizations moved
+us decisively into faster-than-real-time territory:
 
-1. **Multi-threading** — plumb a global `g_n_threads`
+1. **Multi-threading** (4.6× speedup alone) — plumb a global `g_n_threads`
    (default = `std::thread::hardware_concurrency()`) into
    `ggml_backend_cpu_set_n_threads` before every `ggml_backend_graph_compute`.
-2. **CFM graph reuse** — the estimator graph is topologically identical on
-   every meanflow step, so we build it once into a `cfm_estimator_cache` and
-   only run new input values through it on subsequent steps.
+2. **CFM graph reuse** (~7% overall) — the estimator graph is topologically
+   identical on every meanflow step, so we build it once into a
+   `cfm_estimator_cache` and only run new input values through it on
+   subsequent steps.
+3. **Flash attention in CFM BasicTransformerBlock** (~34% off CFM, ~18%
+   overall) — swap the explicit `softmax(QKᵀ/√d) · V` kernel for
+   `ggml_flash_attn_ext`. 56 attention ops × 2 CFM steps = 112 calls per
+   utterance, all fused. No materialized `T×T` scores/attn tensors.
+4. **Fold symmetric conv padding** — drop 6 redundant `ggml_pad_ext + conv`
+   pairs (most impactful in the HiFT ResBlocks) by passing the padding to
+   `ggml_im2col` directly instead of padding as a separate op. Saves one
+   intermediate tensor allocation per resblock conv (72+ in HiFT alone).
 
 Measured on our 10-core workstation, for an 8.64 s utterance:
 
-| Configuration                            | Total   | RTF  | vs real-time |
-|------------------------------------------|---------|------|--------------|
-| 1 thread, graph rebuilt per step         | 22.5 s  | 2.60 | 2.6× slower  |
-| 10 threads, graph rebuilt per step       | 3.47 s  | 0.40 | 2.5× faster  |
-| **10 threads + CFM graph reuse**         | **3.09 s** | **0.36** | **2.8× faster** |
+| Configuration                                           | Total   | RTF  | vs real-time |
+|---------------------------------------------------------|---------|------|--------------|
+| 1 thread, graph rebuilt per step, no flash attn         | 22.5 s  | 2.60 | 2.6× slower  |
+| 10 threads, graph rebuilt per step, no flash attn       | 3.47 s  | 0.40 | 2.5× faster  |
+| 10 threads + CFM graph reuse, no flash attn             | 3.09 s  | 0.36 | 2.8× faster  |
+| **10 threads + CFM graph reuse + flash attn + pad fold**| **2.39 s** | **0.28** | **3.6× faster** |
 
-Stage breakdown (10 threads, 8.64 s output):
+Total speedup from the baseline single-threaded path: **9.4×**.
+
+Stage breakdown at the final configuration (10 threads, 8.64 s output):
 
 | Stage                     | time     |
 |---------------------------|----------|
-| S3Gen encoder             | 289 ms   |
-| CFM 2 meanflow steps      | 1396 ms  |
-| HiFT vocoder              | 1401 ms  |
-| **Total**                 | **3.09 s** |
+| S3Gen encoder             | 286 ms   |
+| CFM 2 meanflow steps      | 785 ms   |
+| HiFT vocoder              | 1312 ms  |
+| **Total**                 | **2.39 s** |
 
-OpenBLAS and `GGML_LTO=ON` were also tried but gave no measurable benefit on
-top of `-march=native` + threading — our bottlenecks are medium-sized convs
-and reductions where hand-written ggml SIMD kernels already dominate BLAS.
+HiFT is now the bottleneck (~55% of wall time) — the remaining convs in the
+3-stage upsample / resblock stack on T=16320 channels are memory-bandwidth
+bound rather than compute bound.
 
-GPU backends (CUDA/Metal) are already wired through `ggml_backend_t` but
-untested for this workload; with the graph reuse in place they should be
-straightforward to enable.
+### What we tried that did NOT help
+
+- **`GGML_BLAS=ON` with OpenBLAS** — no measurable change. Our matmuls are
+  medium-sized and ggml's hand-written AVX-512 kernels already saturate what
+  OpenBLAS would deliver.
+- **`GGML_LTO=ON`** — no measurable effect on shared-library build.
+- **Converting CFM linear weights to F16** — regression. Saved ~100 MB in
+  the GGUF but made CFM ~10% slower (F16→F32 upconvert inside mul_mat is
+  not free, and the F32 AVX-512 kernel is already very fast).
+- **Flash attention in the Conformer encoder** — incompatible. The Conformer
+  uses ESPnet-style relative positional bias that's added inside the softmax,
+  which `ggml_flash_attn_ext` does not support.
+
+### Still on the table
+
+- **Quantizing the T3 GPT-2 Medium backbone** to Q4\_K\_M / Q5\_K — this
+  only affects the separate `chatterbox` (T3) binary, not `chatterbox-tts`.
+- **GPU backends** (CUDA / Metal) — already wired through `ggml_backend_t`.
+- **Pre-compiled / cached graphs across utterances** — for server mode,
+  extend the `cfm_estimator_cache` pattern to the encoder and HiFT graphs.
 
 ### Bug hunts along the way
 
