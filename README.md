@@ -23,8 +23,8 @@ optimization pass that got us to **3.6× faster than real-time on CPU**.
   └────────────┘                        │  + HiFT vocoder (mel → wav)  │
        ▲                                 └──────────────────────────────┘
        │                                               ▲
-    BPE tokenizer                               reference voice
-    (vocab.json, merges.txt)                    (embedding / prompt tokens / prompt feat)
+   BPE tokenizer                                reference voice
+   (embedded in T3 GGUF metadata)               (embedded in S3Gen GGUF)
 ```
 
 `scripts/synthesize.sh` chains the two binaries into a single `text → wav`
@@ -87,15 +87,16 @@ python scripts/convert-s3gen-to-gguf.py --out models/chatterbox-s3gen.gguf
 ```
 
 The scripts pull `ResembleAI/chatterbox-turbo` from Hugging Face Hub on
-first run (about 1.5 GB). They also cache `vocab.json`, `merges.txt`, and
-`added_tokens.json` which the C++ tokenizer reads at runtime (see §3 for
-how they're located).
+first run (about 1.5 GB). The BPE tokenizer (`vocab.json` + `merges.txt` +
+`added_tokens.json`) is **embedded directly into the T3 GGUF** as
+`tokenizer.ggml.*` metadata, so you don't need to keep those three files
+around on disk.
 
 You should now have:
 
 ```
 models/
-  chatterbox-t3-turbo.gguf   (~730 MB, F16 T3 weights)
+  chatterbox-t3-turbo.gguf   (~730 MB, F16 T3 weights + embedded GPT-2 BPE tokenizer)
   chatterbox-s3gen.gguf      (~410 MB, F32 S3Gen + HiFT weights + built-in voice)
 ```
 
@@ -122,7 +123,6 @@ That wraps the two-binary pipeline:
 
 ./build/chatterbox \
   --model models/chatterbox-t3-turbo.gguf \
-  --tokenizer-dir "$TOKENIZER_DIR" \
   --text "Hello from native C plus plus." \
   --output /tmp/tokens.txt
 
@@ -132,18 +132,20 @@ That wraps the two-binary pipeline:
   --out /tmp/out.wav
 ```
 
-The tokenizer directory is auto-located in this order, first hit wins:
+Everything is self-contained in the two `.gguf` files:
 
-1. `$CHATTERBOX_TOKENIZER_DIR/vocab.json` (env var override)
-2. `./tokenizer/vocab.json` (copy `vocab.json`, `merges.txt`,
-   `added_tokens.json` here if you don't want to depend on the HF cache)
-3. `~/.cache/huggingface/hub/models--ResembleAI--chatterbox-turbo/snapshots/*/`
-   (the dir that the converter scripts populate on first run)
+- `chatterbox-t3-turbo.gguf` embeds the BPE tokenizer (vocab + merges +
+  added tokens) as standard `tokenizer.ggml.*` metadata.
+- `chatterbox-s3gen.gguf` embeds the built-in reference voice (embedding,
+  prompt token, prompt mel) under `s3gen/builtin/*`.
 
-`chatterbox-tts` reads the built-in reference voice from the s3gen GGUF by
-default. Pass `--ref-dir DIR` to override with a custom set of
-`embedding.npy` / `prompt_token.npy` / `prompt_feat.npy` files (used for
-validation and custom-voice workflows).
+Legacy knobs if you ever need them:
+
+- `--tokenizer-dir DIR` on `chatterbox` — override the embedded tokenizer,
+  or supply one if the GGUF was built before tokenizer embedding landed.
+- `--ref-dir DIR` on `chatterbox-tts` — override the built-in voice with
+  `embedding.npy` / `prompt_token.npy` / `prompt_feat.npy` (used by
+  validation and custom-voice workflows).
 
 Play the result:
 
@@ -241,11 +243,12 @@ chatterbox.cpp/
 
 ## Troubleshooting
 
-**`gpt2_bpe: failed to open .../vocab.json`** — `synthesize.sh` couldn't
-find the tokenizer. Either set `CHATTERBOX_TOKENIZER_DIR` before running
-it, or drop `vocab.json`, `merges.txt`, and `added_tokens.json` into a
-`tokenizer/` directory at the repo root. The HF snapshot dir that
-`convert-t3-turbo-to-gguf.py` populates on first run works too.
+**`error: GGUF has no embedded tokenizer and --tokenizer-dir was not provided`**
+— you're running against a legacy T3 GGUF built before the tokenizer was
+embedded. Re-run the converter (`python scripts/convert-t3-turbo-to-gguf.py
+--out models/chatterbox-t3-turbo.gguf`) or pass `--tokenizer-dir DIR` to
+point at a directory holding `vocab.json`, `merges.txt`, and
+`added_tokens.json`.
 
 **`--debug requires --ref-dir`** — debug mode substitutes Python-dumped
 random bits to make every intermediate tensor bit-exactly comparable.

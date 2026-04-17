@@ -111,6 +111,11 @@ struct chatterbox_model {
     ggml_backend_buffer_t buffer_kv = nullptr;
 
     std::map<std::string, ggml_tensor *> tensors;
+
+    // Tokenizer embedded in GGUF metadata (empty when the GGUF predates the
+    // tokenizer-in-GGUF change; caller should then fall back to --tokenizer-dir).
+    std::vector<std::string> tok_tokens;
+    std::vector<std::string> tok_merges;
 };
 
 // --------------------------------------------------------------------------
@@ -140,7 +145,9 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "\noptions:\n");
     fprintf(stderr, "  --model PATH            GGUF model produced by convert-t3-turbo-to-gguf.py\n");
     fprintf(stderr, "  --text TEXT             Input text (uses built-in GPT-2 BPE tokenizer)\n");
-    fprintf(stderr, "  --tokenizer-dir PATH    Directory with vocab.json + merges.txt (required with --text)\n");
+    fprintf(stderr, "  --tokenizer-dir PATH    Directory with vocab.json + merges.txt + added_tokens.json.\n");
+    fprintf(stderr, "                          Only needed if the GGUF was produced before the tokenizer\n");
+    fprintf(stderr, "                          was embedded (recent GGUFs carry it in metadata).\n");
     fprintf(stderr, "  --tokens-file PATH      Pre-tokenized text token ids (alternative to --text)\n");
     fprintf(stderr, "  --output PATH           Output file for generated speech tokens\n");
     fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
@@ -182,8 +189,8 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else { fprintf(stderr, "error: unknown argument: %s\n", arg.c_str()); return false; }
     }
     if (params.dump_tokens_only) {
-        if (params.text.empty() || params.tokenizer_dir.empty()) {
-            fprintf(stderr, "error: --dump-tokens-only requires --text and --tokenizer-dir\n");
+        if (params.text.empty()) {
+            fprintf(stderr, "error: --dump-tokens-only requires --text\n");
             return false;
         }
         return true;
@@ -192,9 +199,10 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
     if (params.text.empty() && params.tokens_file.empty()) {
         fprintf(stderr, "error: either --text or --tokens-file is required\n"); return false;
     }
-    if (!params.text.empty() && params.tokenizer_dir.empty()) {
-        fprintf(stderr, "error: --tokenizer-dir is required when using --text\n"); return false;
-    }
+    // Note: when --text is given and the GGUF has no embedded tokenizer,
+    // main() will check for --tokenizer-dir after loading the model and
+    // emit a clear error. We no longer require it up-front because recent
+    // GGUFs embed the tokenizer.
     return true;
 }
 
@@ -348,6 +356,29 @@ static bool load_model_gguf(const std::string & path, chatterbox_model & model, 
         fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
                 ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
                 ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
+
+        // Read embedded tokenizer arrays if present (added by converter-v2).
+        {
+            const int64_t tok_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.tokens");
+            const int64_t mer_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.merges");
+            if (tok_kid >= 0 && mer_kid >= 0) {
+                const size_t n_tok = gguf_get_arr_n(gguf_ctx, tok_kid);
+                const size_t n_mer = gguf_get_arr_n(gguf_ctx, mer_kid);
+                model.tok_tokens.reserve(n_tok);
+                for (size_t i = 0; i < n_tok; ++i) {
+                    model.tok_tokens.emplace_back(gguf_get_arr_str(gguf_ctx, tok_kid, i));
+                }
+                model.tok_merges.reserve(n_mer);
+                for (size_t i = 0; i < n_mer; ++i) {
+                    model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
+                }
+                fprintf(stderr, "%s: tokenizer embedded (%zu tokens, %zu merges)\n",
+                        __func__, n_tok, n_mer);
+            } else {
+                fprintf(stderr, "%s: no embedded tokenizer; --tokenizer-dir will be required for --text\n",
+                        __func__);
+            }
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "%s: %s\n", __func__, e.what());
         gguf_free(gguf_ctx); if (tmp_ctx) ggml_free(tmp_ctx);
@@ -646,14 +677,28 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }
 
     try {
+        // Load model first so we can use the GGUF-embedded tokenizer (if any).
+        chatterbox_model model;
+        if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
+
         std::vector<int32_t> text_tokens;
         if (!params.text.empty()) {
             gpt2_bpe bpe;
-            std::string dir = params.tokenizer_dir;
-            if (dir.back() != '/') dir += '/';
-            if (!bpe.load_vocab_json(dir + "vocab.json")) return 1;
-            if (!bpe.load_merges_txt(dir + "merges.txt")) return 1;
-            bpe.load_added_tokens_json(dir + "added_tokens.json");
+            bool tok_loaded = false;
+            if (!model.tok_tokens.empty()) {
+                tok_loaded = bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
+            }
+            if (!tok_loaded) {
+                if (params.tokenizer_dir.empty()) {
+                    fprintf(stderr, "error: GGUF has no embedded tokenizer and --tokenizer-dir was not provided\n");
+                    return 1;
+                }
+                std::string dir = params.tokenizer_dir;
+                if (dir.back() != '/') dir += '/';
+                if (!bpe.load_vocab_json(dir + "vocab.json")) return 1;
+                if (!bpe.load_merges_txt(dir + "merges.txt")) return 1;
+                bpe.load_added_tokens_json(dir + "added_tokens.json");
+            }
 
             std::string normalized = gpt2_bpe::punc_norm(params.text);
             text_tokens = bpe.tokenize(normalized);
@@ -673,9 +718,6 @@ int main(int argc, char ** argv) {
             text_tokens = read_token_file(params.tokens_file);
         }
         if (text_tokens.empty()) throw std::runtime_error("empty token input");
-
-        chatterbox_model model;
-        if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
 
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         std::mt19937 rng(params.seed);

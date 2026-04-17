@@ -163,6 +163,27 @@ bool gpt2_bpe::load_added_tokens_json(const std::string & path) {
     return true;
 }
 
+// ---- in-memory loader for GGUF-embedded tokenizer -------------------------
+
+bool gpt2_bpe::load_from_arrays(const std::vector<std::string> & tokens,
+                                const std::vector<std::string> & merges) {
+    if (tokens.empty()) return false;
+
+    id_to_token = tokens;
+    token_to_id.clear();
+    token_to_id.reserve(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        token_to_id[tokens[i]] = (int32_t) i;
+    }
+
+    bpe_ranks.clear();
+    bpe_ranks.reserve(merges.size());
+    for (size_t i = 0; i < merges.size(); ++i) {
+        bpe_ranks[merges[i]] = (int) i;
+    }
+    return true;
+}
+
 // ---- GPT-2 pre-tokenization regex ------------------------------------------
 // Pattern: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
 

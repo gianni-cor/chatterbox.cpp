@@ -27,23 +27,14 @@ TTS_BIN="$ROOT/build/chatterbox-tts"
 T3_GGUF="$ROOT/models/chatterbox-t3-turbo.gguf"
 S3G_GGUF="$ROOT/models/chatterbox-s3gen.gguf"
 
-# Tokenizer lookup order:
-#   1. $CHATTERBOX_TOKENIZER_DIR if set
-#   2. <repo>/tokenizer/ if it exists
-#   3. HF snapshot dir if present
+# The tokenizer is embedded in chatterbox-t3-turbo.gguf as GGUF metadata,
+# so no separate path is required. For legacy GGUFs without an embedded
+# tokenizer, set CHATTERBOX_TOKENIZER_DIR (or use --tokenizer-dir directly).
+TOKENIZER_ARGS=""
 if [[ -n "${CHATTERBOX_TOKENIZER_DIR:-}" ]] && [[ -f "$CHATTERBOX_TOKENIZER_DIR/vocab.json" ]]; then
-    TOKENIZER_DIR="$CHATTERBOX_TOKENIZER_DIR"
+    TOKENIZER_ARGS="--tokenizer-dir $CHATTERBOX_TOKENIZER_DIR"
 elif [[ -f "$ROOT/tokenizer/vocab.json" ]]; then
-    TOKENIZER_DIR="$ROOT/tokenizer"
-else
-    HF_SNAPSHOT_DIR="$(ls -d $HOME/.cache/huggingface/hub/models--ResembleAI--chatterbox-turbo/snapshots/*/ 2>/dev/null | head -1 || true)"
-    if [[ -n "$HF_SNAPSHOT_DIR" ]] && [[ -f "$HF_SNAPSHOT_DIR/vocab.json" ]]; then
-        TOKENIZER_DIR="$HF_SNAPSHOT_DIR"
-    else
-        echo "error: could not locate vocab.json / merges.txt. Set" >&2
-        echo "       CHATTERBOX_TOKENIZER_DIR, or place them in $ROOT/tokenizer/" >&2
-        exit 1
-    fi
+    TOKENIZER_ARGS="--tokenizer-dir $ROOT/tokenizer"
 fi
 
 if [[ ! -x "$T3_BIN" ]] || [[ ! -x "$TTS_BIN" ]]; then
@@ -57,10 +48,10 @@ done
 TMP="$(mktemp)"
 trap "rm -f $TMP" EXIT
 
-echo ">>> [1/2] T3: text -> speech tokens (tokenizer: $TOKENIZER_DIR)"
+echo ">>> [1/2] T3: text -> speech tokens"
 "$T3_BIN" \
     --model "$T3_GGUF" \
-    --tokenizer-dir "$TOKENIZER_DIR" \
+    ${TOKENIZER_ARGS} \
     --text "$TEXT" \
     --output "$TMP" \
     ${EXTRA_ARGS} > /dev/null

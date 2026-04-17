@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -43,6 +44,46 @@ def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np
     if transpose:
         array = array.T
     return np.ascontiguousarray(array)
+
+
+def load_tokenizer_assets(ckpt_dir: Path):
+    """Read vocab.json + merges.txt + added_tokens.json and return arrays
+    ready to embed as GGUF metadata.
+
+    Returns (tokens, types, merges):
+      tokens:  list[str], token text indexed by token id
+      types:   list[int], gguf TokenType (1=NORMAL, 4=USER_DEFINED for added tokens)
+      merges:  list[str], BPE merge rules in "left right" format (header skipped)
+    """
+    vocab_path  = ckpt_dir / "vocab.json"
+    merges_path = ckpt_dir / "merges.txt"
+    added_path  = ckpt_dir / "added_tokens.json"
+
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))  # {token: id}
+    added = {}
+    if added_path.exists():
+        added = json.loads(added_path.read_text(encoding="utf-8"))
+
+    id_to_tok = {int(idx): tok for tok, idx in vocab.items()}
+    for tok, idx in added.items():
+        id_to_tok[int(idx)] = tok
+
+    max_id = max(id_to_tok) if id_to_tok else -1
+    tokens = []
+    types  = []
+    for i in range(max_id + 1):
+        tok = id_to_tok.get(i, "")
+        tokens.append(tok)
+        types.append(int(gguf.TokenType.USER_DEFINED) if tok in added else int(gguf.TokenType.NORMAL))
+
+    merges = []
+    for line in merges_path.read_text(encoding="utf-8").splitlines():
+        line = line.rstrip("\r\n")
+        if not line or line.startswith("#"):
+            continue
+        merges.append(line)
+
+    return tokens, types, merges
 
 
 def map_tensor_name(name: str):
@@ -127,6 +168,17 @@ def main() -> None:
     writer.add_float32("chatterbox.layer_norm_eps", LAYER_NORM_EPS)
     writer.add_string("chatterbox.variant", "t3_turbo")
     writer.add_string("chatterbox.reference_repo", REPO_ID)
+
+    # Embed the GPT-2 BPE tokenizer so the C++ binary has no runtime dependency
+    # on vocab.json / merges.txt / added_tokens.json on disk.
+    tok_tokens, tok_types, tok_merges = load_tokenizer_assets(ckpt_dir)
+    writer.add_tokenizer_model("gpt2")
+    writer.add_token_list(tok_tokens)
+    writer.add_token_types(tok_types)
+    writer.add_token_merges(tok_merges)
+    print(f"Embedded tokenizer: {len(tok_tokens)} tokens, "
+          f"{sum(1 for t in tok_types if t == int(gguf.TokenType.USER_DEFINED))} added, "
+          f"{len(tok_merges)} merges")
 
     exported = 0
     ignored = []
