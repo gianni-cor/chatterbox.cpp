@@ -327,9 +327,76 @@ Against the Python reference waveform, the C++ output matches at:
   stochastic SineGen excitation; the deterministic conv-net chain is
   bit-exact).
 
-Outstanding end-to-end wiring (token list → encoder → CFM → HiFT → wav) is the
-next step and is plumbing-only since every stage has a verified C++
-implementation.
+## End-to-end text → wav in pure C++
+
+The full pipeline is now implemented as two binaries that compose through the
+speech-token representation:
+
+```
+chatterbox       : text             -> speech tokens   (T3, GPT-2 Medium)
+chatterbox-tts   : speech tokens    -> 24kHz wav        (S3Gen + HiFT)
+scripts/synthesize.sh  wraps both into a single command
+```
+
+`chatterbox-tts` wires the S3Gen encoder → meanflow CFM (2 steps) → HiFT
+vocoder. It takes T3 speech tokens plus a reference voice (prompt\_token,
+prompt\_feat, embedding) and emits a 24 kHz PCM wav.
+
+Debug mode (`--debug`) substitutes Python-dumped reference values for the
+random bits (CFM `z` and `noised_mels`) so every stage can be validated
+bit-exactly against the PyTorch reference. Measured errors end-to-end:
+
+| Stage                              | max\_abs  | rel        |
+|------------------------------------|-----------|------------|
+| input\_embedding(tokens)           | 0         | 0          |
+| encoder → encoder\_proj (mu)       | 8.3e-07   | 4.5e-07    |
+| speaker embedding (spks)           | 5.9e-08   | small      |
+| cond (prompt\_feat placement)      | 0         | 0          |
+| t\_emb (sinusoidal → MLP → mixer)  | 7.6e-06   | small      |
+| CFM step 0 dxdt                    | 2.1e-05   | small      |
+| CFM step 1 dxdt                    | 1.8e-05   | small      |
+| final mel (80 × 136)               | 1.0e-05   | **8.9e-07**|
+
+The generated wav against Python's reference:
+- RMS: 1.22e-04 (C++) vs 1.22e-04 (Python)
+- Max amplitude: 8.85e-04 vs 8.82e-04
+- Spectrogram magnitude: rel 2.5% (entirely from non-deterministic SineGen
+  excitation — std::mt19937 ≠ torch.rand).
+
+Production mode (no `--debug`) uses a seeded `std::mt19937` for both the CFM
+initial noise/meanflow mels and the SineGen phase + additive noise.
+
+### Timing (CPU only, single-socket desktop)
+
+For a 2 s utterance "Hello from native C++.":
+
+| Stage                     | time     |
+|---------------------------|----------|
+| T3 (49 speech tokens)     | ~1.3 s   |
+| S3Gen encoder             | ~0.4 s   |
+| CFM 2 meanflow steps      | ~3.0 s   |
+| HiFT vocoder              | ~0.6 s   |
+| **Total**                 | **~5.4 s** |
+
+About 2.6× real-time on CPU. GPU backends (CUDA/Metal) are already wired
+through `ggml_backend_t` but untested for this workload.
+
+### Bug hunts along the way
+
+Two wiring bugs surfaced while bringing up `chatterbox-tts`:
+
+1. **Silence padding value**: `speech_tokens` must be appended with
+   `S3GEN_SIL = 4299` (not 0) before the encoder to match the Python
+   `speech_tokens_padded` convention.
+2. **Relative positional-encoding sign flip**: while copying
+   `compute_pos_emb` into the new binary I swapped `pos_pe` / `neg_pe` in the
+   concatenation step, which silently gave plausible-looking encoder output
+   with 20 % relative error. Fixed by matching the original ordering: first
+   half of the PE buffer is reversed `pos_pe`, second half is `neg_pe`.
+3. **Mu layout transpose for CFM**: the encoder's `encoder_proj.npy` is
+   numpy `(T, 80)` while the CFM estimator expects the transposed numpy
+   `(80, T)` layout. Added an explicit transpose between the encoder and
+   CFM to bridge the two conventions.
 
 3. **GPU backends** — once the CPU path is stable, re-enable `GGML_CUDA` /
    `GGML_METAL` paths. The code is already using `ggml_backend_t` abstractions

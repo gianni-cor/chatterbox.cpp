@@ -19,6 +19,10 @@ add_executable(mel2wav src/mel2wav.cpp)
 target_link_libraries(mel2wav PRIVATE ggml)
 target_include_directories(mel2wav PRIVATE ggml/include src)
 
+add_executable(chatterbox-tts src/chatterbox_tts.cpp)
+target_link_libraries(chatterbox-tts PRIVATE ggml)
+target_include_directories(chatterbox-tts PRIVATE ggml/include src)
+
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)
 endif()
