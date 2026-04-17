@@ -360,6 +360,67 @@ HiFT is now the bottleneck (~55 % of wall time) — the 3-stage upsample /
 ResBlock stack on `T = 16320 × 64` channels is memory-bandwidth bound rather
 than compute bound.
 
+### 3.9  Post-launch bug: sampling defaults collapsed long prompts into silence
+
+After merging the two binaries and shipping voice-cloning phase 1, a user
+report of an "empty" wav on paragraph-length input surfaced a sampling bug
+that had been lurking since the T3 port.
+
+Symptom: the produced wav had ~1 second of speech followed by ~9 seconds of
+pure zero RMS. Per-0.5 s window RMS:
+
+```
+[3.5e-2, 1.3e-2, 2.8e-7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4.4e-7]
+```
+
+Dumping the T3 token stream showed the root cause immediately — 240 of 257
+tokens were the silence token `4218`:
+
+```
+tokens[0:17]:   3704, 6486, 4299, 3891, 5832, 4384, 5014, 5665, 2486, 29,
+                29, 380, 632, 2912, 5101, 5070, 4215
+tokens[17:257]: 4218, 4218, 4218, 4218, ...  (240 copies)
+```
+
+The C++ sampler had shipped with `top_k = 1` (argmax) as its default. For
+Chatterbox T3 that's a known failure mode: once the model generates a
+silence token at a natural pause, `argmax(logits)` keeps picking silence
+forever and the utterance never recovers. Short test prompts never reached
+a pause so the bug was invisible during the port.
+
+Compared `ChatterboxTurboTTS.generate()` in `tts_turbo.py` — the Python
+defaults are very different:
+
+|                | before (C++ broken) | Python     | after (C++ fixed) |
+|----------------|--------------------:|-----------:|------------------:|
+| `top_k`        | 1  (greedy)         | 1000       | **1000**          |
+| `top_p`        | 1.0                 | 0.95       | **0.95**          |
+| `temperature`  | 1.0                 | 0.8        | **0.8**           |
+| `repeat_penalty`| 1.0                | 1.2        | **1.2**           |
+| `n_predict`    | 256                 | ~1000      | **1000**          |
+
+All four knobs are still exposed on the CLI, so `--top-k 1` reproduces the
+old greedy behaviour for debugging/comparison.
+
+After the fix, same prompt same seed:
+
+- total wav RMS: `8.3e-03` → `4.8e-02`
+- max amplitude: `0.18` → `0.50`
+- per-0.5 s RMS windows: all 21 non-zero (3.3e-2 … 8.5e-2 range)
+- audible speech for the full 10.7 s
+
+Committed as [`bb0eb99`](https://github.com/gianni-cor/chatterbox.cpp/commit/bb0eb99).
+
+### Lesson
+
+This one was avoidable — the verification pipeline in §5 is per-tensor
+numerical parity, which is oblivious to sampler choices; the `reference-
+t3-turbo.py` harness only compared greedy token sequences so it never
+exercised any non-trivial pass of the sampling ladder. Worth adding an
+end-to-end sampling test to the validation list: run T3 with Python's
+stochastic defaults (fixed seed) and compare the full token stream
+byte-for-byte against C++ with the same seed.
+
 ---
 
 ## Verification approach
