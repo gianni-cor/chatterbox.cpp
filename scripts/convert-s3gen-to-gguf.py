@@ -220,13 +220,11 @@ def main():
         gguf_name = k.replace("flow.decoder.estimator.", "cfm/").replace(".", "/")
         writer.add_tensor(gguf_name, as_numpy(state[k], dtype=torch.float32))
 
-    # mel2wav — conv kernels (3D) to F16
+    # mel2wav (HiFTGenerator) — F32 (we use conv1d_f32 helper)
     mel2wav_keys = sorted(k for k in state if k.startswith("mel2wav."))
     for k in mel2wav_keys:
         gguf_name = k.replace("mel2wav.", "hift/").replace(".", "/")
-        t = state[k]
-        dtype = torch.float16 if t.ndim == 3 else torch.float32
-        writer.add_tensor(gguf_name, as_numpy(t, dtype=dtype))
+        writer.add_tensor(gguf_name, as_numpy(state[k], dtype=torch.float32))
 
     n_flow = sum(1 for k in state if k.startswith("flow.")) - sum(1 for k in state if k.startswith("flow.decoder.estimator."))
     n_cfm  = len(decoder_keys)

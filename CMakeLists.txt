@@ -15,6 +15,10 @@ add_executable(test-s3gen src/test_s3gen.cpp)
 target_link_libraries(test-s3gen PRIVATE ggml)
 target_include_directories(test-s3gen PRIVATE ggml/include src)
 
+add_executable(mel2wav src/mel2wav.cpp)
+target_link_libraries(mel2wav PRIVATE ggml)
+target_include_directories(mel2wav PRIVATE ggml/include src)
+
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)
 endif()

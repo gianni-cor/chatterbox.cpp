@@ -1517,9 +1517,710 @@ static void stage_G4(const model_ctx & m, const std::string & ref_dir) {
     ggml_free(ctx);
 }
 
+// ---------- HiFTGenerator (Stage H*) ----------
+
+// Snake activation: x + (1/alpha) * sin^2(alpha * x)
+// alpha shape (C,), x shape ne=[T, C]. Broadcast alpha along T.
+static ggml_tensor * snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * alpha) {
+    // alpha ne=[C], reshape to ne=[1, C] for broadcast over T axis of ne=[T, C]
+    ggml_tensor * a = ggml_reshape_2d(ctx, alpha, 1, alpha->ne[0]);
+    // ax = x * alpha (broadcast)
+    ggml_tensor * ax = ggml_mul(ctx, x, a);
+    // sin(ax)
+    ggml_tensor * sin_ax = ggml_unary(ctx, ax, GGML_UNARY_OP_STEP);  // placeholder
+    // Actually we need sin. Let me check if ggml_sin exists.
+    (void)sin_ax;
+    // Use ggml_sin
+    ggml_tensor * s = ggml_sin(ctx, ax);
+    // sin^2
+    ggml_tensor * s2 = ggml_mul(ctx, s, s);
+    // 1/alpha (with tiny epsilon to avoid div by 0). Use reshape broadcast.
+    // ggml doesn't have scalar div; use 1/alpha tensor.
+    // We create a constant 1 tensor same shape as alpha, then div.
+    // Simpler: pre-compute 1/alpha in CPU and feed it. But alpha is a loaded tensor...
+    // We can: scale(alpha, 1/eps) doesn't help. Use ggml_div(1_tensor, alpha).
+    // Actually ggml_div(one, alpha) exists but we need a unit tensor.
+    // Since alpha is small and we call this many times, just use 1/(alpha+eps) via divide:
+    //   one_over_alpha = 1 / alpha (elementwise)
+    // We can build a "ones_like(alpha)" input once. For simplicity, pass it as an extra parameter.
+    // Actually simpler: precompute inv_alpha from alpha using ggml_div with a ones constant.
+    // For now, build ones tensor using ggml_new_f32 and set value 1.
+    // ggml has ggml_dup_tensor but we need a fresh tensor. Use ggml_new_tensor_1d and mark input.
+    // Hmm, but we don't have that context available here. So we pass inv_alpha in.
+    (void)s2;
+    return x;  // placeholder; we'll use snake_inv below
+}
+
+// Snake activation implementation that takes alpha and 1/alpha as separate inputs.
+// This avoids the cost of computing 1/alpha inside the graph each time.
+static ggml_tensor * snake_with_inv(ggml_context * ctx, ggml_tensor * x,
+                                    ggml_tensor * alpha, ggml_tensor * inv_alpha) {
+    ggml_tensor * a  = ggml_reshape_2d(ctx, alpha,     1, alpha->ne[0]);      // ne=[1, C]
+    ggml_tensor * ia = ggml_reshape_2d(ctx, inv_alpha, 1, inv_alpha->ne[0]);  // ne=[1, C]
+    ggml_tensor * ax = ggml_mul(ctx, x, a);
+    ggml_tensor * s  = ggml_sin(ctx, ax);
+    ggml_tensor * s2 = ggml_mul(ctx, s, s);
+    ggml_tensor * t  = ggml_mul(ctx, s2, ia);
+    return ggml_add(ctx, x, t);
+}
+
+// Stage H1: f0_predictor
+//   5 × (Conv1d(80 or 512, 512, k=3, pad=1) + ELU), Linear(512, 1), abs, squeeze
+static void stage_H1(const model_ctx & m, const std::string & ref_dir) {
+    fprintf(stderr, "\n=== Stage H1: f0_predictor ===\n");
+    npy_array mel_npy = npy_load(ref_dir + "/mel_output.npy");  // (80, T)
+    npy_array exp_npy = npy_load(ref_dir + "/hift_f0.npy");     // (T,)
+    int MEL = 80;
+    int T = (int)mel_npy.shape[1];
+    fprintf(stderr, "  T=%d\n", T);
+
+    static size_t buf_size = ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(512, false);
+    static std::vector<uint8_t> buf(buf_size);
+    ggml_init_params gp = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 512, false);
+
+    ggml_tensor * mel_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL);
+    ggml_set_name(mel_in, "mel_in"); ggml_set_input(mel_in);
+
+    // condnet: 5 pairs of Conv1d(k=3, pad=1) + ELU
+    // Input: ne=[T, 80], output: ne=[T, 512]
+    ggml_tensor * x = mel_in;
+    int C = MEL;
+    for (int i = 0; i < 5; ++i) {
+        int layer_idx = i * 2;  // condnet[0, 2, 4, 6, 8] (ELU has no weights at [1,3,5,7,9])
+        std::string pfx = "hift/f0_predictor/condnet/" + std::to_string(layer_idx);
+        ggml_tensor * w = find_tensor(m, pfx + "/weight");  // ne=[3, C_in, 512]
+        ggml_tensor * b = find_tensor(m, pfx + "/bias");    // ne=[512]
+        int C_out = (int)w->ne[2];
+        // Pad 1 symmetric
+        ggml_tensor * xp = ggml_pad_ext(ctx, x, 1, 1, 0, 0, 0, 0, 0, 0);
+        x = conv1d_f32(ctx, w, xp, 1, 0, 1);  // ne=[T, C_out]
+        x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
+        x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
+        C = C_out;
+    }
+
+    // classifier: Linear(C=512, 1). Weight (1, 512) numpy -> ggml ne=[512, 1]. bias (1,).
+    // x ne=[T, 512]. For mul_mat need reduction over ne[0]. Permute x to ne=[512, T].
+    ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));  // ne=[512, T]
+    ggml_tensor * cw = find_tensor(m, "hift/f0_predictor/classifier/weight");  // ne=[512, 1]
+    ggml_tensor * cb = find_tensor(m, "hift/f0_predictor/classifier/bias");    // ne=[1]
+    ggml_tensor * y = ggml_mul_mat(ctx, cw, xp);  // ne=[1, T]
+    y = ggml_add(ctx, y, cb);
+    y = ggml_abs(ctx, y);
+    // Squeeze to ne=[T]
+    y = ggml_reshape_1d(ctx, y, T);
+
+    ggml_set_name(y, "out"); ggml_set_output(y);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), npy_as_f32(mel_npy), 0, mel_npy.data.size());
+    ggml_backend_graph_compute(m.backend, gf);
+
+    std::vector<float> out_data(ggml_nelements(y));
+    ggml_backend_tensor_get(y, out_data.data(), 0, ggml_nbytes(y));
+    auto s = compare_f32(out_data.data(), npy_as_f32(exp_npy), std::min(out_data.size(), exp_npy.n_elements()));
+    print_compare("f0", s);
+
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx);
+}
+
+// Precompute 1/alpha for Snake from an F32 tensor.
+// Returns a CPU buffer; caller feeds it into the graph as an input.
+static std::vector<float> invert_alpha(const model_ctx & m, const std::string & name) {
+    ggml_tensor * t = find_tensor(m, name);
+    std::vector<float> alpha(ggml_nelements(t));
+    ggml_backend_tensor_get(t, alpha.data(), 0, ggml_nbytes(t));
+    std::vector<float> inv(alpha.size());
+    for (size_t i = 0; i < alpha.size(); ++i) inv[i] = 1.0f / (alpha[i] + 1e-9f);
+    return inv;
+}
+
+// ResBlock: 3 pairs of (Snake, Conv1d_dilated, Snake, Conv1d, residual)
+// Each dilation in [1, 3, 5], kernel = 3 or 7 or 11
+// Input ne=[T, C], output ne=[T, C]
+struct resblock_w {
+    struct pair_w {
+        ggml_tensor *alpha1, *conv1_w, *conv1_b;
+        ggml_tensor *alpha2, *conv2_w, *conv2_b;
+        // 1/alpha provided externally via graph inputs
+    };
+    std::vector<pair_w> pairs;
+    std::vector<std::string> inv_alpha1_names;  // names for graph inputs "inv_<prefix>_a1_i"
+    std::vector<std::string> inv_alpha2_names;
+};
+
+static resblock_w load_resblock(const model_ctx & m, const std::string & prefix, int n_pairs = 3) {
+    resblock_w rb;
+    for (int i = 0; i < n_pairs; ++i) {
+        resblock_w::pair_w p;
+        p.alpha1  = find_tensor(m, prefix + "/activations1/" + std::to_string(i) + "/alpha");
+        p.conv1_w = find_tensor(m, prefix + "/convs1/" + std::to_string(i) + "/weight");
+        p.conv1_b = find_tensor(m, prefix + "/convs1/" + std::to_string(i) + "/bias");
+        p.alpha2  = find_tensor(m, prefix + "/activations2/" + std::to_string(i) + "/alpha");
+        p.conv2_w = find_tensor(m, prefix + "/convs2/" + std::to_string(i) + "/weight");
+        p.conv2_b = find_tensor(m, prefix + "/convs2/" + std::to_string(i) + "/bias");
+        rb.pairs.push_back(p);
+    }
+    return rb;
+}
+
+static ggml_tensor * resblock_forward(ggml_context * ctx, const resblock_w & rb,
+                                      ggml_tensor * x, int C,
+                                      const std::vector<int> & dilations,
+                                      int kernel_size,
+                                      ggml_tensor ** inv_a1_tensors,
+                                      ggml_tensor ** inv_a2_tensors) {
+    for (size_t i = 0; i < rb.pairs.size(); ++i) {
+        const auto & p = rb.pairs[i];
+        int dilation = dilations[i];
+        // get_padding(k, dilation) = (k*dilation - dilation)/2
+        int pad1 = (kernel_size * dilation - dilation) / 2;
+        int pad2 = (kernel_size - 1) / 2;
+        // Snake 1
+        ggml_tensor * xt = snake_with_inv(ctx, x, p.alpha1, inv_a1_tensors[i]);
+        // Conv1d with dilation
+        xt = ggml_pad_ext(ctx, xt, pad1, pad1, 0, 0, 0, 0, 0, 0);
+        xt = conv1d_f32(ctx, p.conv1_w, xt, 1, 0, dilation);
+        xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.conv1_b, 1, C));
+        // Snake 2
+        xt = snake_with_inv(ctx, xt, p.alpha2, inv_a2_tensors[i]);
+        // Conv1d (no dilation)
+        xt = ggml_pad_ext(ctx, xt, pad2, pad2, 0, 0, 0, 0, 0, 0);
+        xt = conv1d_f32(ctx, p.conv2_w, xt, 1, 0, 1);
+        xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.conv2_b, 1, C));
+        x = ggml_add(ctx, x, xt);
+    }
+    return x;
+}
+
+// ConvTranspose1d with symmetric padding.
+// We use ggml_conv_transpose_1d.
+// Input ne=[L_in, IC], kernel ne=[K, OC, IC]. Output ne=[L_out, OC].
+// L_out = (L_in - 1) * stride + K - 2 * padding.
+static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx,
+                                           ggml_tensor * kernel,
+                                           ggml_tensor * input,
+                                           int stride, int padding) {
+    // ggml_conv_transpose_1d only supports p0=0, so we call with p0=0 to get the FULL
+    // output, then slice off `padding` elements from each side of the time axis (ne[0]).
+    ggml_tensor * out = ggml_conv_transpose_1d(ctx, kernel, input, stride, 0, 1);
+    if (padding == 0) return out;
+    // out ne=[L_full, OC, N]. Keep [padding, L_full - padding) along ne[0].
+    int64_t L_full = out->ne[0];
+    int64_t L_new = L_full - 2 * padding;
+    ggml_tensor * sliced = ggml_view_3d(ctx, out,
+                                        L_new, out->ne[1], out->ne[2],
+                                        out->nb[1], out->nb[2],
+                                        (size_t)padding * out->nb[0]);
+    return ggml_cont(ctx, sliced);
+}
+
+// Stage H3: HiFT decode body up to conv_post output
+// Inputs: mel (80, 136), pre-computed s_stft (18, T_stft=16321)
+// Output: conv_post output (18, 16321)
+static void stage_H3(const model_ctx & m, const std::string & ref_dir) {
+    fprintf(stderr, "\n=== Stage H3: HiFT decode body (conv_pre -> conv_post) ===\n");
+    npy_array mel_npy     = npy_load(ref_dir + "/mel_output.npy");      // (80, 136)
+    npy_array s_stft_npy  = npy_load(ref_dir + "/hift_s_stft.npy");     // (18, 16321)
+    npy_array exp_npy     = npy_load(ref_dir + "/hift_conv_post.npy");  // (18, 16321)
+
+    int MEL = 80;
+    int T_mel = (int)mel_npy.shape[1];    // 136
+    int T_stft = (int)s_stft_npy.shape[1]; // 16321
+    int NFFT2 = 18;  // n_fft + 2
+    int BASE_CH = 512;
+    fprintf(stderr, "  T_mel=%d T_stft=%d\n", T_mel, T_stft);
+
+    // Upsample rates and kernel sizes
+    std::vector<int> ups_rates = {8, 5, 3};
+    std::vector<int> ups_ksizes = {16, 11, 7};
+    std::vector<int> ups_ch = {256, 128, 64};
+    std::vector<int> rb_ksizes = {3, 7, 11};
+    std::vector<std::vector<int>> rb_dilations = {{1,3,5}, {1,3,5}, {1,3,5}};
+    std::vector<int> src_rb_ksizes = {7, 11};  // actually 3 for Chatterbox's [7,7,11]
+    // Actually check: source_resblock_kernel_sizes=[7, 7, 11] for our case
+    src_rb_ksizes = {7, 7, 11};
+    std::vector<std::vector<int>> src_rb_dilations = {{1,3,5}, {1,3,5}, {1,3,5}};
+
+    static size_t buf_size = 8*1024*1024;  // 8 MB for graph buffer
+    static std::vector<uint8_t> buf(buf_size);
+    ggml_init_params gp = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 131072, false);
+
+    ggml_tensor * mel_in    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_mel,  MEL);    ggml_set_name(mel_in, "mel_in"); ggml_set_input(mel_in);
+    ggml_tensor * s_stft_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_stft, NFFT2);  ggml_set_name(s_stft_in, "s_stft_in"); ggml_set_input(s_stft_in);
+
+    // Precompute 1/alpha inputs for every Snake call. We have:
+    //   3 source_resblocks × 3 pairs × 2 alphas = 18 alphas
+    //   9 resblocks × 3 pairs × 2 alphas = 54 alphas
+    // Build graph inputs and register CPU buffers.
+    struct inv_alpha_entry {
+        std::string graph_name;
+        std::vector<float> data;
+        ggml_tensor * tensor;
+    };
+    std::vector<inv_alpha_entry> inv_alphas;
+    auto make_inv_alpha_input = [&](const std::string & name_prefix, int C) {
+        std::string gn = "inv_" + name_prefix;  // distinct from weight tensor name
+        std::vector<float> inv = invert_alpha(m, name_prefix);
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(t, gn.c_str());
+        ggml_set_input(t);
+        inv_alphas.push_back({gn, std::move(inv), t});
+        return t;
+    };
+
+    // conv_pre: Conv1d(80, 512, k=7, pad=3)
+    ggml_tensor * conv_pre_w = find_tensor(m, "hift/conv_pre/weight");
+    ggml_tensor * conv_pre_b = find_tensor(m, "hift/conv_pre/bias");
+    ggml_tensor * xp = ggml_pad_ext(ctx, mel_in, 3, 3, 0, 0, 0, 0, 0, 0);
+    ggml_tensor * x = conv1d_f32(ctx, conv_pre_w, xp, 1, 0, 1);
+    x = ggml_add(ctx, x, ggml_reshape_2d(ctx, conv_pre_b, 1, BASE_CH));  // ne=[136, 512]
+    ggml_set_name(x, "conv_pre_out"); ggml_set_output(x);
+
+    // Main loop: 3 upsamples
+    for (int i = 0; i < 3; ++i) {
+        // leaky_relu
+        x = ggml_leaky_relu(ctx, x, 0.1f, false);
+
+        // ups[i]: ConvTranspose1d
+        // PyTorch weight shape: (in_channels, out_channels, kernel_size) = (512 or 256 or 128, 256 or 128 or 64, k)
+        // In ggml ne=[k, out_c, in_c]. But ggml_conv_transpose_1d expects kernel ne=[K, OC, IC]? Let me check.
+        ggml_tensor * up_w = find_tensor(m, "hift/ups/" + std::to_string(i) + "/weight");
+        ggml_tensor * up_b = find_tensor(m, "hift/ups/" + std::to_string(i) + "/bias");
+        int stride = ups_rates[i];
+        int k = ups_ksizes[i];
+        int up_pad = (k - stride) / 2;
+        (void)up_pad;
+        // ConvTranspose1d with padding=(k-s)/2. In ggml_conv_transpose_1d, the padding parameter
+        // shrinks output length. Output len = (L_in-1)*stride + K - 2*pad.
+        x = conv_transpose_1d_f32(ctx, up_w, x, stride, up_pad);
+        // Add bias
+        x = ggml_add(ctx, x, ggml_reshape_2d(ctx, up_b, 1, ups_ch[i]));
+        if (i == 0) { ggml_set_name(x, "ups0_out"); ggml_set_output(x); }
+        if (i == 1) { ggml_set_name(x, "ups1_out"); ggml_set_output(x); }
+        if (i == 2) { ggml_set_name(x, "ups2_out"); ggml_set_output(x); }
+
+        // Reflection pad on last upsample: pad 1 on LEFT with x[1] (PyTorch ReflectionPad1d((1, 0))).
+        // [a, b, c, d] -> [b, a, b, c, d]  (take index 1, prepend)
+        if (i == 2) {
+            // Extract x[1:2] along ne[0] (time axis)
+            ggml_tensor * x_slice = ggml_view_3d(ctx, x,
+                                                 /*ne0=*/1, x->ne[1], x->ne[2],
+                                                 x->nb[1], x->nb[2],
+                                                 /*offset=*/1 * x->nb[0]);
+            x_slice = ggml_cont(ctx, x_slice);
+            x = ggml_concat(ctx, x_slice, x, 0);
+        }
+
+        // fusion: x += source_down[i](s_stft) -> source_resblock[i]
+        ggml_tensor * sd_w = find_tensor(m, "hift/source_downs/" + std::to_string(i) + "/weight");
+        ggml_tensor * sd_b = find_tensor(m, "hift/source_downs/" + std::to_string(i) + "/bias");
+        // source_downs[i]: Conv1d with (u*2, u, pad=u/2) or (1, 1, 0) for last
+        // Based on the weights we have:
+        //   0: k=30, stride=8, pad=4  (u = prod = 15; u*2=30)
+        //   1: k=6,  stride=5, pad=3  (u = 3; u*2=6)
+        //   2: k=1,  stride=1, pad=0
+        int sd_k = (int)sd_w->ne[0];
+        int sd_ic = (int)sd_w->ne[1];
+        int sd_oc = (int)sd_w->ne[2];
+        (void)sd_ic;
+        // source_downs use cumulative upsample rates reversed: downsample_cum_rates=[1,3,15] -> reversed [15,3,1]
+        // For u in [15, 3, 1]: stride=u, kernel=u*2 (or 1 when u=1), pad=u/2
+        int sd_stride, sd_pad;
+        if (i == 0) { sd_stride = 15; sd_pad = 7; }   // k=30
+        else if (i == 1) { sd_stride = 3; sd_pad = 1; } // k=6
+        else { sd_stride = 1; sd_pad = 0; }             // k=1
+        ggml_tensor * sd_in = ggml_pad_ext(ctx, s_stft_in, sd_pad, sd_pad, 0, 0, 0, 0, 0, 0);
+        ggml_tensor * si = conv1d_f32(ctx, sd_w, sd_in, sd_stride, 0, 1);
+        si = ggml_add(ctx, si, ggml_reshape_2d(ctx, sd_b, 1, sd_oc));
+        if (i == 0) { ggml_set_name(si, "sd0_out"); ggml_set_output(si); }
+        (void)sd_k;
+
+        // source_resblock[i]
+        std::string srb_prefix = "hift/source_resblocks/" + std::to_string(i);
+        auto srb = load_resblock(m, srb_prefix);
+        ggml_tensor * srb_a1_invs[3], * srb_a2_invs[3];
+        for (int j = 0; j < 3; ++j) {
+            srb_a1_invs[j] = make_inv_alpha_input(srb_prefix + "/activations1/" + std::to_string(j) + "/alpha", ups_ch[i]);
+            srb_a2_invs[j] = make_inv_alpha_input(srb_prefix + "/activations2/" + std::to_string(j) + "/alpha", ups_ch[i]);
+        }
+        si = resblock_forward(ctx, srb, si, ups_ch[i], src_rb_dilations[i], src_rb_ksizes[i], srb_a1_invs, srb_a2_invs);
+        if (i == 0) { ggml_set_name(si, "sr0_out"); ggml_set_output(si); }
+
+        // x + si  (shapes should match)
+        x = ggml_add(ctx, x, si);
+
+        // 3 parallel resblocks averaged
+        ggml_tensor * xs = nullptr;
+        for (int j = 0; j < 3; ++j) {
+            int rb_idx = i * 3 + j;
+            std::string rb_prefix = "hift/resblocks/" + std::to_string(rb_idx);
+            auto rb = load_resblock(m, rb_prefix);
+            ggml_tensor * rb_a1_invs[3], * rb_a2_invs[3];
+            for (int k2 = 0; k2 < 3; ++k2) {
+                rb_a1_invs[k2] = make_inv_alpha_input(rb_prefix + "/activations1/" + std::to_string(k2) + "/alpha", ups_ch[i]);
+                rb_a2_invs[k2] = make_inv_alpha_input(rb_prefix + "/activations2/" + std::to_string(k2) + "/alpha", ups_ch[i]);
+            }
+            ggml_tensor * rb_out = resblock_forward(ctx, rb, x, ups_ch[i], rb_dilations[j], rb_ksizes[j], rb_a1_invs, rb_a2_invs);
+            if (i == 0 && j == 0) { ggml_set_name(rb_out, "rb0_out"); ggml_set_output(rb_out); }
+            if (xs == nullptr) xs = rb_out;
+            else xs = ggml_add(ctx, xs, rb_out);
+        }
+        x = ggml_scale(ctx, xs, 1.0f / 3.0f);
+    }
+
+    // final leaky_relu
+    x = ggml_leaky_relu(ctx, x, 0.01f, false);  // default negative_slope when not specified is 0.01
+
+    // conv_post: Conv1d(64, 18, k=7, pad=3)
+    ggml_tensor * cp_w = find_tensor(m, "hift/conv_post/weight");
+    ggml_tensor * cp_b = find_tensor(m, "hift/conv_post/bias");
+    ggml_tensor * xp2 = ggml_pad_ext(ctx, x, 3, 3, 0, 0, 0, 0, 0, 0);
+    x = conv1d_f32(ctx, cp_w, xp2, 1, 0, 1);
+    x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp_b, 1, NFFT2));
+
+    ggml_set_name(x, "out"); ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), npy_as_f32(mel_npy), 0, mel_npy.data.size());
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "s_stft_in"), npy_as_f32(s_stft_npy), 0, s_stft_npy.data.size());
+    // Set all 1/alpha inputs
+    for (const auto & ia : inv_alphas) {
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ia.graph_name.c_str()),
+                                ia.data.data(), 0, ia.data.size() * sizeof(float));
+    }
+
+    fprintf(stderr, "  computing (%zu 1/alpha inputs)...\n", inv_alphas.size());
+    ggml_backend_graph_compute(m.backend, gf);
+
+    std::vector<float> out_data(ggml_nelements(x));
+    ggml_backend_tensor_get(x, out_data.data(), 0, ggml_nbytes(x));
+
+    fprintf(stderr, "  out shape ne=[%lld, %lld] vs ref (%lld, %lld)\n",
+            (long long)x->ne[0], (long long)x->ne[1], (long long)exp_npy.shape[0], (long long)exp_npy.shape[1]);
+
+    auto check = [&](const char * name, const std::string & ne_name, const std::string & ref_file) {
+        ggml_tensor * t = ggml_graph_get_tensor(gf, ne_name.c_str());
+        if (!t) { fprintf(stderr, "  [%s] tensor not in graph\n", name); return; }
+        npy_array exp = npy_load(ref_dir + "/" + ref_file);
+        std::vector<float> data(ggml_nelements(t));
+        ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+        fprintf(stderr, "  [%s] got shape ne=[%lld,%lld] ref=(%lld,%lld)\n",
+                name, (long long)t->ne[0], (long long)t->ne[1],
+                (long long)exp.shape[0], (long long)exp.shape[1]);
+        auto ss = compare_f32(data.data(), npy_as_f32(exp), std::min(data.size(), exp.n_elements()));
+        print_compare(name, ss);
+    };
+    check("conv_pre", "conv_pre_out", "hift_conv_pre.npy");
+    check("ups0",     "ups0_out",     "hift_ups0.npy");
+    check("sd0",      "sd0_out",      "hift_sd0.npy");
+    check("sr0",      "sr0_out",      "hift_sr0.npy");
+    check("rb0",      "rb0_out",      "hift_rb0.npy");
+    check("ups1",     "ups1_out",     "hift_ups1.npy");
+    check("ups2",     "ups2_out",     "hift_ups2.npy");
+
+    auto s = compare_f32(out_data.data(), npy_as_f32(exp_npy), std::min(out_data.size(), exp_npy.n_elements()));
+    print_compare("conv_post", s);
+
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx);
+}
+
+// Build a DFT + window kernel for STFT.
+// Kernel shape is ggml ne=[N, 1, n_fft+2].
+// K[n, 0, f]   = cos(2π*f*n/N) * window[n]      for f in [0, n_fft/2 + 1]
+// K[n, 0, F+f] = -sin(2π*f*n/N) * window[n]     for f in [0, n_fft/2 + 1]
+static std::vector<float> build_stft_kernel(int n_fft, const std::vector<float> & window) {
+    int F = n_fft / 2 + 1;
+    int OC = 2 * F;
+    std::vector<float> K((size_t)n_fft * 1 * OC, 0.0f);
+    const double two_pi = 2.0 * M_PI;
+    for (int f = 0; f < F; ++f) {
+        int oc_re = f;
+        int oc_im = F + f;
+        for (int n = 0; n < n_fft; ++n) {
+            double theta = two_pi * (double)f * (double)n / (double)n_fft;
+            float w = window[n];
+            K[n + oc_re * n_fft] = (float)(std::cos(theta) * w);
+            K[n + oc_im * n_fft] = (float)(-std::sin(theta) * w);
+        }
+    }
+    return K;
+}
+
+static std::vector<float> build_hann_window(int n, bool periodic = true) {
+    std::vector<float> w(n);
+    double N = periodic ? (double)n : (double)(n - 1);
+    const double two_pi = 2.0 * M_PI;
+    for (int i = 0; i < n; ++i) {
+        w[i] = (float)(0.5 * (1.0 - std::cos(two_pi * (double)i / N)));
+    }
+    return w;
+}
+
+// Reflection pad along ne[0] (time). Builds by concatenating single-element slices.
+static ggml_tensor * reflect_pad_1d(ggml_context * ctx, ggml_tensor * x, int p_left, int p_right) {
+    ggml_tensor * y = x;
+    if (p_left > 0) {
+        for (int i = 0; i < p_left; ++i) {
+            int src_idx = p_left - i;  // reflects 1..p_left
+            ggml_tensor * s = ggml_view_3d(ctx, x,
+                                           1, x->ne[1], x->ne[2],
+                                           x->nb[1], x->nb[2],
+                                           (size_t)src_idx * x->nb[0]);
+            s = ggml_cont(ctx, s);
+            y = ggml_concat(ctx, s, y, 0);
+        }
+    }
+    if (p_right > 0) {
+        int L_orig = (int)x->ne[0];
+        for (int i = 0; i < p_right; ++i) {
+            int src_idx = L_orig - 2 - i;
+            ggml_tensor * s = ggml_view_3d(ctx, x,
+                                           1, x->ne[1], x->ne[2],
+                                           x->nb[1], x->nb[2],
+                                           (size_t)src_idx * x->nb[0]);
+            s = ggml_cont(ctx, s);
+            y = ggml_concat(ctx, y, s, 0);
+        }
+    }
+    return y;
+}
+
+// Stage H4: STFT of time-domain source signal
+//   Input: source signal (65280,)
+//   Output: spec (18, 16321) = concat(real(9, T_stft), imag(9, T_stft))
+static void stage_H4(const model_ctx & m, const std::string & ref_dir) {
+    (void)m;
+    fprintf(stderr, "\n=== Stage H4: STFT ===\n");
+    npy_array src_npy = npy_load(ref_dir + "/hift_msource_tup0.npy");
+    npy_array exp_npy = npy_load(ref_dir + "/hift_s_stft.npy");
+
+    int T_src = (int)src_npy.shape[0];  // 65280
+    int n_fft = 16;
+    int hop = 4;
+    int F = n_fft / 2 + 1;
+
+    auto window = build_hann_window(n_fft, true);
+    auto kernel_data = build_stft_kernel(n_fft, window);
+
+    static size_t buf_size = 4 * 1024 * 1024;
+    static std::vector<uint8_t> buf(buf_size);
+    ggml_init_params gp = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+
+    ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_src, 1);
+    ggml_set_name(src, "src"); ggml_set_input(src);
+
+    int pad_amt = n_fft / 2;
+    ggml_tensor * src_padded = reflect_pad_1d(ctx, src, pad_amt, pad_amt);
+
+    ggml_tensor * kernel = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_fft, 1, 2 * F);
+    ggml_set_name(kernel, "kernel"); ggml_set_input(kernel);
+
+    ggml_tensor * spec = conv1d_f32(ctx, kernel, src_padded, hop, 0, 1);
+    ggml_set_name(spec, "spec"); ggml_set_output(spec);
+    ggml_build_forward_expand(gf, spec);
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "src"), npy_as_f32(src_npy), 0, src_npy.data.size());
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kernel"), kernel_data.data(), 0, kernel_data.size() * sizeof(float));
+    ggml_backend_graph_compute(cpu, gf);
+
+    std::vector<float> out_data(ggml_nelements(spec));
+    ggml_backend_tensor_get(spec, out_data.data(), 0, ggml_nbytes(spec));
+
+    fprintf(stderr, "  spec ne=[%lld, %lld] ref=(%lld, %lld)\n",
+            (long long)spec->ne[0], (long long)spec->ne[1],
+            (long long)exp_npy.shape[0], (long long)exp_npy.shape[1]);
+
+    auto s = compare_f32(out_data.data(), npy_as_f32(exp_npy), std::min(out_data.size(), exp_npy.n_elements()));
+    print_compare("stft", s);
+
+    ggml_gallocr_free(allocr);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+}
+
+// Inverse DFT + window kernel for ISTFT.
+// K shape ggml ne=[n_fft, 1, n_fft+2] (kernel for conv_transpose_1d).
+// K[n, 0, k_re] =  coef(k) * cos(2π*k*n/N) * window[n] / N    for k in [0, F)
+// K[n, 0, F+k_im] = -coef(k) * sin(2π*k*n/N) * window[n] / N   for k in [0, F)
+// coef = 1 for k=0 and k=N/2; 2 otherwise.
+// For k=0 and k=N/2 imaginary component: coef=0 (doesn't contribute to real output).
+static std::vector<float> build_istft_kernel(int n_fft, const std::vector<float> & window) {
+    int F = n_fft / 2 + 1;
+    int IC = 2 * F;  // input channels in conv_transpose terms
+    // ggml kernel ne=[K, OC, IC] where K=n_fft, OC=1, IC=2F.
+    std::vector<float> K((size_t)n_fft * 1 * IC, 0.0f);
+    const double two_pi = 2.0 * M_PI;
+    const double inv_N = 1.0 / (double)n_fft;
+    for (int f = 0; f < F; ++f) {
+        double coef_re = (f == 0 || f == n_fft / 2) ? 1.0 : 2.0;
+        double coef_im = (f == 0 || f == n_fft / 2) ? 0.0 : 2.0;
+        for (int n = 0; n < n_fft; ++n) {
+            double theta = two_pi * (double)f * (double)n / (double)n_fft;
+            float w = window[n];
+            K[n + 0 * n_fft + f       * n_fft] = (float)(coef_re * std::cos(theta) * w * inv_N);
+            K[n + 0 * n_fft + (F + f) * n_fft] = (float)(-coef_im * std::sin(theta) * w * inv_N);
+        }
+    }
+    return K;
+}
+
+// Window normalization buffer for ISTFT.
+// w_sum[t_total] = sum over frames t such that t*hop <= t_total < t*hop + n_fft of window[t_total - t*hop]^2
+static std::vector<float> build_window_sum(int T_stft, int n_fft, int hop, const std::vector<float> & window) {
+    int L = (T_stft - 1) * hop + n_fft;
+    std::vector<float> ws(L, 0.0f);
+    for (int t = 0; t < T_stft; ++t) {
+        int base = t * hop;
+        for (int n = 0; n < n_fft; ++n) {
+            ws[base + n] += window[n] * window[n];
+        }
+    }
+    return ws;
+}
+
+// Stage H5: ISTFT of conv_post output -> waveform
+static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
+    (void)m;
+    fprintf(stderr, "\n=== Stage H5: ISTFT (conv_post -> waveform) ===\n");
+    npy_array cp_npy  = npy_load(ref_dir + "/hift_conv_post.npy");  // (18, 16321)
+    npy_array wav_npy = npy_load(ref_dir + "/waveform.npy");         // (65280,)
+
+    int n_fft = 16;
+    int hop = 4;
+    int F = n_fft / 2 + 1;
+    int T_stft = (int)cp_npy.shape[1];
+    int L_raw = (T_stft - 1) * hop + n_fft;  // before trim
+    int L_wav = L_raw - n_fft;                // after center trim
+    fprintf(stderr, "  T_stft=%d L_raw=%d L_wav=%d (ref=%lld)\n", T_stft, L_raw, L_wav, (long long)wav_npy.shape[0]);
+
+    // Python decode:
+    //   magnitude = exp(cp[:F, :])
+    //   phase = sin(cp[F:, :])  # note they say "sin is redundancy" but they DO apply it
+    //   real = magnitude * cos(phase)
+    //   imag = magnitude * sin(phase)
+    //   wav = istft(complex(real, imag))
+    //   wav = clamp(wav, -audio_limit, audio_limit)
+
+    auto window = build_hann_window(n_fft, true);
+    auto istft_kernel = build_istft_kernel(n_fft, window);   // ne=[n_fft, 1, 2F]
+    auto w_sum = build_window_sum(T_stft, n_fft, hop, window);
+
+    static size_t buf_size = 16 * 1024 * 1024;
+    static std::vector<uint8_t> buf(buf_size);
+    ggml_init_params gp = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
+
+    // Input: cp (2F, T_stft) in Python = ggml ne=[T_stft, 2F]
+    ggml_tensor * cp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_stft, 2 * F);
+    ggml_set_name(cp, "cp"); ggml_set_input(cp);
+
+    // Build magnitude and phase via slicing
+    size_t row_stride = cp->nb[0];   // elem size
+    size_t col_stride = cp->nb[1];   // row size = T_stft * elem
+    // mag = exp(cp[:, :F])  (first F channels along ne[1])
+    ggml_tensor * mag_log = ggml_view_2d(ctx, cp, T_stft, F, col_stride, 0);
+    mag_log = ggml_cont(ctx, mag_log);
+    // Clamp to <= 1e2
+    mag_log = ggml_clamp(ctx, mag_log, -1e6f, 1e2f);  // lower clamp doesn't apply, only upper
+    ggml_tensor * mag = ggml_exp(ctx, mag_log);
+
+    // phase = sin(cp[:, F:])
+    ggml_tensor * ph_in = ggml_view_2d(ctx, cp, T_stft, F, col_stride, (size_t)F * col_stride);
+    ph_in = ggml_cont(ctx, ph_in);
+    ggml_tensor * ph = ggml_sin(ctx, ph_in);
+
+    // real = mag * cos(phase), imag = mag * sin(phase)
+    // We need cos(sin(x)) here? No wait -- python code:
+    //   magnitude = exp(x[:, :F, :])
+    //   phase = sin(x[:, F:, :])
+    //   real = magnitude * cos(phase)
+    //   imag = magnitude * sin(phase)
+    // So phase is the "pre-phase", and cos(phase), sin(phase) get used. phase IS sin(...) from the model output.
+    // We need cos(sin(x)) and sin(sin(x)).
+    ggml_tensor * cos_ph = ggml_cos(ctx, ph);
+    ggml_tensor * sin_ph = ggml_sin(ctx, ph);
+    ggml_tensor * real = ggml_mul(ctx, mag, cos_ph);   // ne=[T_stft, F]
+    ggml_tensor * imag = ggml_mul(ctx, mag, sin_ph);
+
+    // Concat real | imag along ne[1] to get ne=[T_stft, 2F]
+    ggml_tensor * spec = ggml_concat(ctx, real, imag, 1);
+
+    // Inverse DFT kernel as an input
+    ggml_tensor * kernel = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_fft, 1, 2 * F);
+    ggml_set_name(kernel, "kernel"); ggml_set_input(kernel);
+
+    // Conv transpose 1d with stride=hop, pad=0 -> ne=[L_raw, 1]
+    ggml_tensor * y = ggml_conv_transpose_1d(ctx, kernel, spec, hop, 0, 1);
+
+    // Divide by w_sum (input)
+    ggml_tensor * ws_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L_raw, 1);
+    ggml_set_name(ws_in, "w_sum"); ggml_set_input(ws_in);
+    y = ggml_div(ctx, y, ws_in);
+
+    // Trim n_fft/2 from each side: view [pad, L_raw - pad) → length L_wav
+    int pad_amt = n_fft / 2;
+    ggml_tensor * y_trim = ggml_view_2d(ctx, y,
+                                        L_wav, y->ne[1],
+                                        y->nb[1],
+                                        (size_t)pad_amt * y->nb[0]);
+    y_trim = ggml_cont(ctx, y_trim);
+
+    // Clamp to [-0.99, 0.99]
+    y_trim = ggml_clamp(ctx, y_trim, -0.99f, 0.99f);
+
+    ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
+    ggml_build_forward_expand(gf, y_trim);
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cp"),     npy_as_f32(cp_npy),        0, cp_npy.data.size());
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kernel"), istft_kernel.data(),       0, istft_kernel.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w_sum"),  w_sum.data(),              0, w_sum.size() * sizeof(float));
+
+    ggml_backend_graph_compute(cpu, gf);
+
+    std::vector<float> out_data(ggml_nelements(y_trim));
+    ggml_backend_tensor_get(y_trim, out_data.data(), 0, ggml_nbytes(y_trim));
+
+    fprintf(stderr, "  wav ne=[%lld, %lld] ref=(%lld,)\n",
+            (long long)y_trim->ne[0], (long long)y_trim->ne[1], (long long)wav_npy.shape[0]);
+
+    auto s = compare_f32(out_data.data(), npy_as_f32(wav_npy), std::min(out_data.size(), wav_npy.n_elements()));
+    print_compare("waveform", s);
+
+    ggml_gallocr_free(allocr);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+}
+
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s S3GEN_GGUF REFERENCE_DIR [stage=A|B|C|D|E|E0|F|G1|G2|G3|G4|ALL]\n", argv[0]);
+        fprintf(stderr, "usage: %s S3GEN_GGUF REFERENCE_DIR [stage=A|B|C|D|E|E0|F|G1|G2|G3|G4|H1|H3|H4|H5|ALL]\n", argv[0]);
         return 1;
     }
     const std::string gguf_path = argv[1];
@@ -1543,6 +2244,10 @@ int main(int argc, char ** argv) {
         if (stage == "G2" || stage == "ALL") stage_G2(m, ref_dir);
         if (stage == "G3" || stage == "ALL") stage_G3(m, ref_dir);
         if (stage == "G4" || stage == "ALL") stage_G4(m, ref_dir);
+        if (stage == "H1" || stage == "ALL") stage_H1(m, ref_dir);
+        if (stage == "H3" || stage == "ALL") stage_H3(m, ref_dir);
+        if (stage == "H4" || stage == "ALL") stage_H4(m, ref_dir);
+        if (stage == "H5" || stage == "ALL") stage_H5(m, ref_dir);
     } catch (const std::exception & e) {
         fprintf(stderr, "error: %s\n", e.what());
         return 1;

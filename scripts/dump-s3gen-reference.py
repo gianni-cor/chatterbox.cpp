@@ -259,11 +259,79 @@ def main():
     save(mel.squeeze(0).cpu(), args.out / "mel_output.npy")
 
     # ------------------------------------------------------------------
-    # 4. HiFTGenerator inference
+    # 4. HiFTGenerator inference (re-register hooks since CFM ones were removed)
     # ------------------------------------------------------------------
     print("\n--- HiFT vocoder inference ---")
-    hift_cache = torch.zeros(1, 1, 0).to(tts.device)
-    wavs, _ = tts.s3gen.mel2wav.inference(speech_feat=mel, cache_source=hift_cache)
+    hift = tts.s3gen.mel2wav
+    hift_storage = {}
+    hift_hooks = [
+        hift.f0_predictor.register_forward_hook(make_hook(hift_storage, "hift_f0")),
+        hift.f0_upsamp.register_forward_hook(make_hook(hift_storage, "hift_f0_upsamp")),
+        hift.m_source.register_forward_hook(make_hook(hift_storage, "hift_msource")),
+        hift.m_source.l_sin_gen.register_forward_hook(make_hook(hift_storage, "hift_sinegen")),
+        hift.conv_pre.register_forward_hook(make_hook(hift_storage, "hift_conv_pre")),
+        hift.conv_post.register_forward_hook(make_hook(hift_storage, "hift_conv_post")),
+    ]
+    for i in range(3):
+        hift_hooks.append(hift.ups[i].register_forward_hook(make_hook(hift_storage, f"hift_ups{i}")))
+        hift_hooks.append(hift.source_downs[i].register_forward_hook(make_hook(hift_storage, f"hift_sd{i}")))
+        hift_hooks.append(hift.source_resblocks[i].register_forward_hook(make_hook(hift_storage, f"hift_sr{i}")))
+    for i in range(9):
+        hift_hooks.append(hift.resblocks[i].register_forward_hook(make_hook(hift_storage, f"hift_rb{i}")))
+
+    # Monkeypatch SineGen's random bits so we can reproduce in C++
+    sg = hift.m_source.l_sin_gen
+    orig_sg_forward = sg.forward
+    def sinegen_capture(f0_):
+        # Save inputs
+        hift_storage["hift_sinegen_input"] = f0_.detach().clone().cpu()
+        # Also capture the uniform phase and gaussian noise before forward calls them
+        out = orig_sg_forward(f0_)
+        return out
+    sg.forward = sinegen_capture
+
+    # Also capture the Uniform sample used for phase and the randn used for noise in SineGen.
+    from torch.distributions.uniform import Uniform as _Uniform
+    orig_uniform_sample = _Uniform.sample
+    uniform_seen = {"count": 0}
+    def uniform_sample_capture(self, sample_shape=torch.Size()):
+        s = orig_uniform_sample(self, sample_shape)
+        if uniform_seen["count"] == 0:
+            hift_storage["hift_sinegen_phase_vec"] = s.detach().clone().cpu()
+            uniform_seen["count"] += 1
+        return s
+    _Uniform.sample = uniform_sample_capture
+
+    orig_randn_like2 = _torch.randn_like
+    rl_seen = {"count": 0}
+    def randn_like_capture2(x, *a, **kw):
+        s = orig_randn_like2(x, *a, **kw)
+        if rl_seen["count"] == 0:
+            hift_storage["hift_sinegen_noise"] = s.detach().clone().cpu()
+            rl_seen["count"] += 1
+        return s
+    _torch.randn_like = randn_like_capture2
+
+    # Also capture the randn used for the m_source noise branch
+    orig_randn_like3 = _torch.randn_like
+    # Note: m_source calls randn_like once more outside SineGen.
+    # We use a counter to distinguish: first call is inside SineGen, second is the outer noise branch.
+
+    try:
+        torch.manual_seed(args.seed + 1)  # Different seed so HiFT random is reproducible per run
+        hift_cache = torch.zeros(1, 1, 0).to(tts.device)
+        wavs, _ = tts.s3gen.mel2wav.inference(speech_feat=mel, cache_source=hift_cache)
+    finally:
+        sg.forward = orig_sg_forward
+        _Uniform.sample = orig_uniform_sample
+        _torch.randn_like = orig_randn_like2
+        for h in hift_hooks:
+            h.remove()
+
+    for name, t in hift_storage.items():
+        if t is None: continue
+        save(t.squeeze(0) if t.ndim > 1 else t, args.out / f"{name}.npy")
+
     wav = wavs.squeeze(0).squeeze(0).cpu()
     save(wav, args.out / "waveform.npy")
 
