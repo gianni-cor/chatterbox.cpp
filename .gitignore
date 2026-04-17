@@ -20,6 +20,12 @@ models/
 # Reference dumps
 artifacts/
 
+# Local tokenizer files (downloaded from HF cache)
+tokenizer/
+
+# Generated audio
+*.wav
+
 # Editor files
 .vscode/
 .idea/
