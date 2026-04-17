@@ -29,6 +29,7 @@
 #include "npy.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -39,7 +40,28 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+// Global thread count (set in main; used to configure CPU backend in each graph run)
+static int g_n_threads = 1;
+
+static double now_ms() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+
+static void compute(ggml_backend_t backend, ggml_cgraph * gf) {
+    if (ggml_backend_is_cpu(backend)) ggml_backend_cpu_set_n_threads(backend, g_n_threads);
+    ggml_backend_graph_compute(backend, gf);
+}
+struct scoped_timer {
+    const char * label;
+    double t0;
+    scoped_timer(const char * l) : label(l), t0(now_ms()) {}
+    ~scoped_timer() { fprintf(stderr, "  [%-16s] %.1f ms\n", label, now_ms() - t0); }
+};
+#define TIMED(label) scoped_timer _st_##__LINE__(label)
 
 // ============================================================================
 // GGUF loader + helpers
@@ -361,7 +383,7 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     compute_pos_emb(pe2, T2, D);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos1"), pe1.data(), 0, pe1.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos2"), pe2.data(), 0, pe2.size()*sizeof(float));
-    ggml_backend_graph_compute(m.backend, gf);
+    compute(m.backend, gf);
 
     std::vector<float> mu_data(ggml_nelements(mu));
     ggml_backend_tensor_get(mu, mu_data.data(), 0, ggml_nbytes(mu));
@@ -533,7 +555,7 @@ static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x"), t_sin.data(), 0, t_sin.size()*sizeof(float));
-    ggml_backend_graph_compute(m.backend, gf);
+    compute(m.backend, gf);
 
     std::vector<float> out(ggml_nelements(y));
     ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
@@ -568,7 +590,7 @@ static std::vector<float> compute_time_mixed(const model_ctx & m,
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_in"), t_mlp.data(), 0, t_mlp.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "r_in"), r_mlp.data(), 0, r_mlp.size()*sizeof(float));
-    ggml_backend_graph_compute(m.backend, gf);
+    compute(m.backend, gf);
 
     std::vector<float> out(ggml_nelements(mixed));
     ggml_backend_tensor_get(mixed, out.data(), 0, ggml_nbytes(mixed));
@@ -577,10 +599,24 @@ static std::vector<float> compute_time_mixed(const model_ctx & m,
     return out;
 }
 
+// Cached CFM estimator state — graph is built once and reused across steps.
+struct cfm_estimator_cache {
+    int T = -1;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    std::vector<uint8_t> buf;
+    ~cfm_estimator_cache() {
+        if (allocr) ggml_gallocr_free(allocr);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
 // Single estimator forward: (x, mu, t_emb, spks, cond) -> dxdt
 // All shapes are numpy (80, T) or (80,) as given, flattened row-major.
 static std::vector<float> cfm_estimator_forward(
     const model_ctx & m,
+    cfm_estimator_cache & cache,
     const std::vector<float> & x,
     const std::vector<float> & mu,
     const std::vector<float> & t_emb,
@@ -590,11 +626,21 @@ static std::vector<float> cfm_estimator_forward(
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
 
-    static size_t buf_size = 256 * 1024 * 1024;  // graph gets big
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 65536, false);
+    const bool build_graph = (cache.T != T);
+    if (build_graph) {
+        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+        if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
+        cache.buf.resize(256 * 1024 * 1024);
+        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+        cache.ctx = ggml_init(gp);
+        cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
+        cache.T = T;
+    }
+    ggml_context * ctx = cache.ctx;
+    ggml_cgraph * gf = cache.gf;
+    if (!build_graph) goto compute_only;  // skip graph build, just update inputs and recompute
+
+    {
 
     ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
     ggml_tensor * mu_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(mu_in, "mu_in"); ggml_set_input(mu_in);
@@ -646,20 +692,22 @@ static std::vector<float> cfm_estimator_forward(
     ggml_set_name(out, "out"); ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(cache.allocr, gf);
+    }  // end graph-build block
+
+compute_only:
+    ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mu_in"), mu.data(), 0, mu.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "spks_in"), spks.data(), 0, spks.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_in"), cond.data(), 0, cond.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb"), t_emb.data(), 0, t_emb.size()*sizeof(float));
-    ggml_backend_graph_compute(m.backend, gf);
+    compute(m.backend, gf);
 
-    std::vector<float> out_data(ggml_nelements(out));
-    ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
+    std::vector<float> out_data(ggml_nelements(out_t));
+    ggml_backend_tensor_get(out_t, out_data.data(), 0, ggml_nbytes(out_t));
     return out_data;
 }
 
@@ -771,7 +819,7 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
-    ggml_backend_graph_compute(m.backend, gf);
+    compute(m.backend, gf);
     std::vector<float> f0(T_mel);
     ggml_backend_tensor_get(y, f0.data(), 0, ggml_nbytes(y));
     ggml_gallocr_free(allocr);
@@ -842,7 +890,7 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "s"), src.data(), 0, src.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "k"), kernel.data(), 0, kernel.size()*sizeof(float));
-    ggml_backend_graph_compute(m.backend, gf);
+    compute(m.backend, gf);
     std::vector<float> out(ggml_nelements(spec));
     ggml_backend_tensor_get(spec, out.data(), 0, ggml_nbytes(spec));
     ggml_gallocr_free(allocr);
@@ -1005,7 +1053,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w_sum"), ws.data(), 0, ws.size()*sizeof(float));
     for (auto & ia : inv_alphas)
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ia.gn.c_str()), ia.data.data(), 0, ia.data.size()*sizeof(float));
-    ggml_backend_graph_compute(m.backend, gf);
+    compute(m.backend, gf);
 
     std::vector<float> wav(ggml_nelements(y_trim));
     ggml_backend_tensor_get(y_trim, wav.data(), 0, ggml_nbytes(y_trim));
@@ -1071,6 +1119,7 @@ int main(int argc, char ** argv) {
     int pre_lookahead_len = 3;  // Chatterbox default
     int token_mel_ratio = 1;    // for T3 output
     bool debug_mode = false;
+    int n_threads = 0;  // 0 -> auto (hw_concurrency)
     (void)token_mel_ratio;
 
     for (int i = 1; i < argc; ++i) {
@@ -1081,12 +1130,16 @@ int main(int argc, char ** argv) {
         else if (a == "--tokens" && i + 1 < argc) tokens_csv = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
+        else if (a == "--threads" && i + 1 < argc) n_threads = std::atoi(argv[++i]);
         else if (a == "--debug") debug_mode = true;
         else {
-            fprintf(stderr, "usage: %s --s3gen-gguf MODEL.gguf --ref-dir DIR [--tokens-file FILE | --tokens CSV] --out OUT.wav [--seed N] [--debug]\n", argv[0]);
+            fprintf(stderr, "usage: %s --s3gen-gguf MODEL.gguf --ref-dir DIR [--tokens-file FILE | --tokens CSV] --out OUT.wav [--seed N] [--threads N] [--debug]\n", argv[0]);
             return 1;
         }
     }
+    if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
+    g_n_threads = n_threads;
+    fprintf(stderr, "Using %d threads\n", g_n_threads);
     if (gguf_path.empty() || ref_dir.empty() || out_path.empty()) {
         fprintf(stderr, "missing required arguments\n");
         return 1;
@@ -1124,8 +1177,10 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < pre_lookahead_len; ++i) padded.push_back(S3GEN_SIL);
 
     fprintf(stderr, "Loading %s\n", gguf_path.c_str());
+    double load_t0 = now_ms();
     model_ctx m = load_s3gen_gguf(gguf_path);
-    fprintf(stderr, "  %zu tensors loaded\n", m.tensors.size());
+    fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), now_ms() - load_t0);
+    double pipeline_t0 = now_ms();
 
     const int D = 512;
     const int MEL = 80;
@@ -1164,7 +1219,9 @@ int main(int argc, char ** argv) {
 
     // 3) Run encoder -> mu_T (numpy (T_mu, 80) layout, to match encoder_proj.npy)
     fprintf(stderr, "Running encoder (T=%d)...\n", n_total);
+    double encoder_t0 = now_ms();
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
+    fprintf(stderr, "  [encoder] %.1f ms\n", now_ms() - encoder_t0);
     int T_mu = 2 * n_total;
     fprintf(stderr, "  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
 
@@ -1295,6 +1352,8 @@ int main(int argc, char ** argv) {
 
     // 7) CFM loop: 2 steps with t_span = [0, 0.5, 1]
     std::vector<float> t_span = {0.0f, 0.5f, 1.0f};
+    cfm_estimator_cache cfm_cache;
+    double cfm_t0 = now_ms();
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
         float t = t_span[s], r = t_span[s + 1];
         float dt = r - t;
@@ -1320,7 +1379,9 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "    [x_in step%zu] max_abs=%.4e rms=%.4e vs ref\n", s, ma, std::sqrt(rsum / nx));
         }
 
-        auto dxdt = cfm_estimator_forward(m, z, mu, t_emb, spks, cond, T_mu);
+        double step_t0 = now_ms();
+        auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
+        fprintf(stderr, "  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
 
         if (debug_mode) {
             npy_array ref = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_dxdt.npy");
@@ -1333,6 +1394,7 @@ int main(int argc, char ** argv) {
 
         for (size_t i = 0; i < z.size(); ++i) z[i] = z[i] + dt * dxdt[i];
     }
+    fprintf(stderr, "  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
 
     // 8) Slice mel = z[:, mel_len1:] -> shape (80, T_mu - mel_len1)
     int T_mel = T_mu - mel_len1;
@@ -1360,6 +1422,7 @@ int main(int argc, char ** argv) {
     }
 
     // 9) HiFT
+    double hift_t0 = now_ms();
     fprintf(stderr, "Running f0_predictor...\n");
     auto f0 = run_f0_predictor(m, mel, T_mel);
     int upsample = 8 * 5 * 3 * 4;
@@ -1383,7 +1446,16 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "Running HiFT decode...\n");
     auto wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
+    fprintf(stderr, "  [hift_total] %.1f ms\n", now_ms() - hift_t0);
     fprintf(stderr, "  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
+
+    double pipeline_total = now_ms() - pipeline_t0;
+    double audio_ms = 1000.0 * wav.size() / sr;
+    fprintf(stderr, "\n=== pipeline: %.1f ms for %.1f ms of audio (RTF=%.2f, %.1fx %s) ===\n",
+            pipeline_total, audio_ms,
+            pipeline_total / audio_ms,
+            audio_ms / pipeline_total >= 1.0 ? audio_ms / pipeline_total : pipeline_total / audio_ms,
+            audio_ms >= pipeline_total ? "faster than real-time" : "slower than real-time");
 
     write_wav(out_path, wav, sr);
     fprintf(stderr, "Wrote %s\n", out_path.c_str());

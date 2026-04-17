@@ -366,20 +366,43 @@ The generated wav against Python's reference:
 Production mode (no `--debug`) uses a seeded `std::mt19937` for both the CFM
 initial noise/meanflow mels and the SineGen phase + additive noise.
 
-### Timing (CPU only, single-socket desktop)
+### Timing (CPU only, 10-core EPYC)
 
-For a 2 s utterance "Hello from native C++.":
+`-march=native` is already enabled by ggml (so AVX-512 / AVX-VNNI are used),
+but the first build used a single thread and no graph reuse. Two
+optimizations moved us decisively into faster-than-real-time territory:
+
+1. **Multi-threading** — plumb a global `g_n_threads`
+   (default = `std::thread::hardware_concurrency()`) into
+   `ggml_backend_cpu_set_n_threads` before every `ggml_backend_graph_compute`.
+2. **CFM graph reuse** — the estimator graph is topologically identical on
+   every meanflow step, so we build it once into a `cfm_estimator_cache` and
+   only run new input values through it on subsequent steps.
+
+Measured on our 10-core workstation, for an 8.64 s utterance:
+
+| Configuration                            | Total   | RTF  | vs real-time |
+|------------------------------------------|---------|------|--------------|
+| 1 thread, graph rebuilt per step         | 22.5 s  | 2.60 | 2.6× slower  |
+| 10 threads, graph rebuilt per step       | 3.47 s  | 0.40 | 2.5× faster  |
+| **10 threads + CFM graph reuse**         | **3.09 s** | **0.36** | **2.8× faster** |
+
+Stage breakdown (10 threads, 8.64 s output):
 
 | Stage                     | time     |
 |---------------------------|----------|
-| T3 (49 speech tokens)     | ~1.3 s   |
-| S3Gen encoder             | ~0.4 s   |
-| CFM 2 meanflow steps      | ~3.0 s   |
-| HiFT vocoder              | ~0.6 s   |
-| **Total**                 | **~5.4 s** |
+| S3Gen encoder             | 289 ms   |
+| CFM 2 meanflow steps      | 1396 ms  |
+| HiFT vocoder              | 1401 ms  |
+| **Total**                 | **3.09 s** |
 
-About 2.6× real-time on CPU. GPU backends (CUDA/Metal) are already wired
-through `ggml_backend_t` but untested for this workload.
+OpenBLAS and `GGML_LTO=ON` were also tried but gave no measurable benefit on
+top of `-march=native` + threading — our bottlenecks are medium-sized convs
+and reductions where hand-written ggml SIMD kernels already dominate BLAS.
+
+GPU backends (CUDA/Metal) are already wired through `ggml_backend_t` but
+untested for this workload; with the graph reuse in place they should be
+straightforward to enable.
 
 ### Bug hunts along the way
 
