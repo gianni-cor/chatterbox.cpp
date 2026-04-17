@@ -150,13 +150,17 @@ struct cli_params {
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
     int32_t n_threads      = std::min(4, (int32_t) std::thread::hardware_concurrency());
-    int32_t n_predict      = 256;
+    int32_t n_predict      = 1000;   // matches Python's default-ish output budget for paragraph-length text
     int32_t n_ctx          = 0;
     int32_t n_gpu_layers   = 0;
-    int32_t top_k          = 1;
-    float   top_p          = 1.0f;
-    float   temp           = 1.0f;
-    float   repeat_penalty = 1.0f;
+    // Sampling defaults matched to ChatterboxTurboTTS.generate() in tts_turbo.py:
+    //   temperature=0.8, top_k=1000, top_p=0.95, repetition_penalty=1.2
+    // The previous greedy defaults (top_k=1) collapse into silence-token
+    // repetition loops on any non-trivial text.
+    int32_t top_k          = 1000;
+    float   top_p          = 0.95f;
+    float   temp           = 0.8f;
+    float   repeat_penalty = 1.2f;
 };
 
 static void print_usage(const char * argv0) {
@@ -179,13 +183,13 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          bit-exact numerical validation (requires --ref-dir).\n");
     fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
     fprintf(stderr, "  --threads N             CPU threads (default: %d)\n", std::min(4, (int32_t) std::thread::hardware_concurrency()));
-    fprintf(stderr, "  --n-predict N           Max speech tokens (default: 256)\n");
+    fprintf(stderr, "  --n-predict N           Max speech tokens (default: 1000)\n");
     fprintf(stderr, "  --context N             Override KV context length\n");
     fprintf(stderr, "  --n-gpu-layers N        GPU backend when N > 0\n");
-    fprintf(stderr, "  --top-k N               (default: 1)\n");
-    fprintf(stderr, "  --top-p P               (default: 1.0)\n");
-    fprintf(stderr, "  --temp T                (default: 1.0)\n");
-    fprintf(stderr, "  --repeat-penalty R      (default: 1.0)\n");
+    fprintf(stderr, "  --top-k N               (default: 1000, matches Python; use 1 for greedy)\n");
+    fprintf(stderr, "  --top-p P               (default: 0.95)\n");
+    fprintf(stderr, "  --temp T                (default: 0.8)\n");
+    fprintf(stderr, "  --repeat-penalty R      (default: 1.2)\n");
     fprintf(stderr, "  -h, --help\n");
 }
 
