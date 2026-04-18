@@ -482,7 +482,7 @@ Ranked by impact-per-effort ratio, from biggest wins to niche polish.
 
 ### Tier A — biggest wins, should be tackled next
 
-#### A1. Voice cloning — **phases 1, 2a, 2b, 2c DONE**, phases 2d-2e pending
+#### A1. Voice cloning — **phases 1, 2a-2c, 2d-a DONE**, phases 2d-b,c + 2e pending
 
 Voice cloning works end-to-end TODAY using a Python preprocessing
 helper that produces a five-tensor voice profile from a reference
@@ -645,7 +645,84 @@ embedding drives T3 conditioning indistinguishably from Python.
 Two down, two to go (`embedding` and `prompt_token` via CAMPPlus +
 S3TokenizerV2).
 
-**Phase 2d (NEXT)** — C++ CAMPPlus (TDNN + stats pooling speaker encoder,
+**Phase 2d-a (DONE)** — C++ CAMPPlus forward pass, validated end-to-end
+against the Python reference on a Python-dumped 80-ch Kaldi fbank.
+
+CAMPPlus is a FunASR/3D-Speaker x-vector: 937 raw tensors (329 conv /
+linear weights + 122 BatchNorms + biases + counters).  Structure:
+
+```
+  fbank (T, 80)
+    → FCM: Conv2d(1→32, k=3) + BN + 2× BasicResBlock (stride=2)
+              + 2× BasicResBlock (stride=2) + Conv2d(32→32, s=(2,1))
+              + reshape → (320, T)
+    → xvector.tdnn: Conv1d(320→128, k=5, s=2) + BN + ReLU
+    → 3 × CAMDenseTDNNBlock + TransitLayer
+         block1: 12 layers, dilation=1  → 128 → 512
+         transit1: Conv1x1 + BN: 512 → 256
+         block2: 24 layers, dilation=2  → 256 → 1024
+         transit2: 1024 → 512
+         block3: 16 layers, dilation=2  → 512 → 1024
+         transit3: 1024 → 512
+    → out_nonlinear (BN + ReLU)
+    → stats_pool (mean + unbiased std over T → 1024)
+    → dense: Conv1x1(1024→192) + BN(affine=False) → 192
+```
+
+Each `CAMDenseTDNNLayer` is `BN→ReLU→Conv1x1→BN→ReLU→CAMLayer`, with
+`CAMLayer` being `linear_local × sigmoid(linear2(ReLU(linear1(ctx))))`
+where `ctx = mean(x, T) + seg_pool(x, 100).expand(T)`.
+
+Ports:
+- `scripts/convert-s3gen-to-gguf.py` — fuses every BatchNorm into a
+  per-channel `(scale, shift)` pair at export time:
+    `scale = gamma / sqrt(var + eps)` (or `1/sqrt(var + eps)` when
+    `affine=False`), `shift = beta - mean*scale`.  Skips
+    `num_batches_tracked`.  Embeds 14 `campplus.*` hyperparameters as
+    GGUF metadata and emits the 451 substantive tensors under
+    `campplus/…` (329 conv + 122 fused BNs).
+- `src/campplus.{h,cpp}` — plain-C++ forward pass, no ggml graph.
+  Uses channel-major `(C, T)` layout throughout.  Helpers: `bn_apply`,
+  `relu_inplace`, `sigmoid_inplace`, `conv1d`, `conv2d`,
+  `seg_pool_expand` (avg-pool with `ceil_mode=True` + repeat-interleave
+  to `T`), `stats_pool` (mean + unbiased std).  Module-level helpers
+  `fcm_basic_resblock`, `fcm_forward`, `cam_layer_forward`,
+  `cam_dense_tdnn_layer_forward`.  Parallelised via OpenMP.
+- `src/test_campplus.cpp` — loads CAMPPlus from `chatterbox-s3gen.gguf`,
+  runs on a Python-dumped `fbank.npy`, compares with Python
+  `embedding.npy` using max_abs / rms / rel / cosine similarity.
+- `scripts/dump-campplus-reference.py` — helper that loads the turbo
+  checkpoint, runs `extract_feature` (Kaldi fbank + per-utterance
+  mean-subtract) and `speaker_encoder.forward`, and dumps the two
+  tensors to `.npy`.
+
+Result on a 10.4 s reference wav (1038 fbank frames, 192-d output):
+
+```
+[result] C++ vs Python embedding:
+    n=192  max_abs=2.34e-05  rms=6.99e-06  max|ref|=2.49e+00  rel=9.38e-06
+    cosine similarity = 1.000000
+    forward pass: 549.9 ms (16-thread EPYC)
+```
+
+`rel = 9.4 ppm`, cosine = 1.000000 — numerical parity. 550 ms for a
+one-time voice-setup pass is comfortably fast.
+
+`src/s3gen_pipeline.h` grew an `embedding_override` field and
+`src/chatterbox_tts.cpp` reads it in place of `ref_dir/embedding.npy`
+when provided, mirroring `prompt_feat_override`.  End-to-end wiring
+into `main.cpp` is blocked on Phase 2d-b (Kaldi fbank port) — we can't
+feed CAMPPlus from `--reference-audio` until the C++ binary can
+extract its own fbank.
+
+**Phase 2d-b (NEXT)** — C++ port of `torchaudio.compliance.kaldi.fbank`
+with `num_mel_bins=80` (no dither, same povey window, preemphasis,
+pow2-padded FFT, Kaldi mel scale, log).  Then Phase 2d-c wires both
+into `main.cpp`: `--reference-audio` runs `wav_load` → resample to
+16 kHz → `fbank_kaldi_80` → mean-subtract over T → `campplus_embed`
+→ injects the 192-d embedding into `s3gen_synthesize_opts`.
+
+**Phase 2d (old)** — C++ CAMPPlus (TDNN + stats pooling speaker encoder,
 80-ch Fbank at 16 kHz → 192-d `embedding`). ~400-line Python, mostly
 dilated 1-D conv stacks; mean/std pooling is trivial to implement.
 

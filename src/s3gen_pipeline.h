@@ -28,6 +28,12 @@ struct s3gen_synthesize_opts {
     std::vector<float> prompt_feat_override;
     int prompt_feat_rows_override = 0;
 
+    // Optional: if non-empty, override the 192-d speaker `embedding` that's
+    // produced by CAMPPlus.  Same motivation as prompt_feat_override: lets
+    // main.cpp replace Python's embedding.npy with a C++ CAMPPlus output
+    // when --reference-audio is given.
+    std::vector<float> embedding_override;
+
     int  seed      = 42;
     int  n_threads = 0;          // 0 = hardware_concurrency
     int  sr        = 24000;

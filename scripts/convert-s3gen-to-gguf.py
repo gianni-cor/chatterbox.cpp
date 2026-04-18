@@ -235,6 +235,99 @@ def main():
     ).astype(np.float32)  # (80, 961)
     writer.add_tensor("s3gen/mel_fb/24k_80", np.ascontiguousarray(mel_fb_24k_80))
 
+    # -------------------------------------------------------------------------
+    # CAMPPlus speaker encoder (FunASR/3D-Speaker xvector port).  Produces the
+    # 192-d `embedding` tensor that drives S3Gen's spk_embed_affine layer.
+    # We fuse every BatchNorm's affine + running stats into a per-channel
+    # (scale, shift) pair so the C++ side can skip BN as its own module.
+    #   y = gamma * (x - mean) / sqrt(var + eps) + beta
+    #     = x * scale + shift
+    #   scale = gamma / sqrt(var + eps)  (=1/sqrt(var+eps) when affine=False)
+    #   shift = beta - mean * scale      (=-mean*scale when affine=False)
+    # -------------------------------------------------------------------------
+    speaker_keys = [k for k in state if k.startswith("speaker_encoder.")]
+    if not speaker_keys:
+        print("warning: no speaker_encoder.* tensors found in s3gen.safetensors")
+    else:
+        BN_EPS = 1e-5  # torch.nn.BatchNorm default
+
+        # Group BN tensors by their prefix (everything before the final component).
+        # A BN module contributes: weight (optional, affine=True), bias (optional),
+        # running_mean, running_var, num_batches_tracked (ignored).
+        bn_groups: dict[str, dict[str, torch.Tensor]] = {}
+        for k in speaker_keys:
+            parts = k.rsplit(".", 1)
+            if len(parts) == 2 and parts[1] in ("weight", "bias", "running_mean",
+                                                "running_var", "num_batches_tracked"):
+                bn_groups.setdefault(parts[0], {})[parts[1]] = state[k]
+
+        # A key is BN-owned iff its group has running_mean AND running_var.
+        bn_prefixes = {p for p, t in bn_groups.items()
+                       if "running_mean" in t and "running_var" in t}
+
+        n_bn = 0
+        n_conv = 0
+        for k in speaker_keys:
+            parts = k.rsplit(".", 1)
+            prefix, last = (parts[0], parts[1]) if len(parts) == 2 else (k, "")
+
+            # Skip training-only counters.
+            if last == "num_batches_tracked":
+                continue
+
+            gguf_base = "campplus/" + prefix.removeprefix("speaker_encoder.").replace(".", "/")
+
+            if prefix in bn_prefixes:
+                if last in ("weight", "bias"):
+                    # Skip the raw gamma/beta; we'll emit the fused scale/shift
+                    # once per group when we hit running_mean.
+                    continue
+                if last == "running_var":
+                    continue
+                if last == "running_mean":
+                    grp = bn_groups[prefix]
+                    mean = grp["running_mean"].float()
+                    var  = grp["running_var"].float()
+                    denom = torch.sqrt(var + BN_EPS)
+                    if "weight" in grp and "bias" in grp:
+                        gamma = grp["weight"].float()
+                        beta  = grp["bias"].float()
+                        scale = gamma / denom
+                        shift = beta - mean * scale
+                    else:
+                        # BatchNorm1d(..., affine=False) — only running stats.
+                        scale = 1.0 / denom
+                        shift = -mean * scale
+                    writer.add_tensor(gguf_base + "/s",
+                                      np.ascontiguousarray(scale.numpy().astype(np.float32)))
+                    writer.add_tensor(gguf_base + "/b",
+                                      np.ascontiguousarray(shift.numpy().astype(np.float32)))
+                    n_bn += 1
+                continue
+
+            # Non-BN tensor: export as-is (F32).
+            gguf_name = "campplus/" + k.removeprefix("speaker_encoder.").replace(".", "/")
+            writer.add_tensor(gguf_name, as_numpy(state[k], dtype=torch.float32))
+            n_conv += 1
+
+        # Hyperparameters.  CAMPPlus() is instantiated with the defaults in
+        # s3gen.py, so hard-code them here to avoid re-encoding in C++.
+        writer.add_uint32("campplus.feat_dim",         80)
+        writer.add_uint32("campplus.embedding_size",   192)
+        writer.add_uint32("campplus.growth_rate",      32)
+        writer.add_uint32("campplus.bn_size",          4)
+        writer.add_uint32("campplus.init_channels",    128)
+        writer.add_uint32("campplus.block1_layers",    12)
+        writer.add_uint32("campplus.block2_layers",    24)
+        writer.add_uint32("campplus.block3_layers",    16)
+        writer.add_uint32("campplus.block1_dilation",  1)
+        writer.add_uint32("campplus.block2_dilation",  2)
+        writer.add_uint32("campplus.block3_dilation",  2)
+        writer.add_uint32("campplus.kernel_size",      3)
+        writer.add_uint32("campplus.seg_pool_len",     100)
+        writer.add_uint32("campplus.sample_rate",      16000)
+        print(f"Embedded CAMPPlus: {n_conv} conv/linear tensors + {n_bn} fused BNs")
+
     n_flow = sum(1 for k in state if k.startswith("flow.")) - sum(1 for k in state if k.startswith("flow.decoder.estimator."))
     n_cfm  = len(decoder_keys)
     n_hift = len(mel2wav_keys)

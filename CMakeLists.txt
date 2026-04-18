@@ -49,6 +49,17 @@ add_executable(test-voice-encoder
 target_link_libraries(test-voice-encoder PRIVATE ggml)
 target_include_directories(test-voice-encoder PRIVATE ggml/include src)
 
+# CAMPPlus validation harness (compares C++ forward against Python embedding).
+add_executable(test-campplus
+    src/test_campplus.cpp
+    src/campplus.cpp)
+target_link_libraries(test-campplus PRIVATE ggml)
+target_include_directories(test-campplus PRIVATE ggml/include src)
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test-campplus PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)
 endif()
