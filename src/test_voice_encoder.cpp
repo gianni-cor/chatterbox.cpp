@@ -33,6 +33,11 @@ int main(int argc, char ** argv) {
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return 1;
     fprintf(stderr, "      sr=%d samples=%zu (%.2f s)\n", sr, wav.size(), (double)wav.size() / sr);
+    {
+        double L0 = measure_lufs(wav, sr);
+        normalise_lufs(wav, sr, -27.0);
+        fprintf(stderr, "      loudness %.2f LUFS → -27 LUFS\n", L0);
+    }
     if (sr != 16000) {
         fprintf(stderr, "      resampling %d -> 16000\n", sr);
         wav = resample_sinc(wav, sr, 16000);

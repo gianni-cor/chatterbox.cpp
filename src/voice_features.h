@@ -40,6 +40,23 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
                                  int taps_half = 16);
 
 // -----------------------------------------------------------------------------
+// Loudness normalisation (ITU-R BS.1770-4 / EBU R 128)
+// -----------------------------------------------------------------------------
+
+// Measure the integrated loudness of a mono float32 signal in LUFS, using the
+// K-weighting filter + 400 ms gated blocks described in ITU-R BS.1770-4.
+// Matches `pyloudnorm.Meter(sr).integrated_loudness(wav)`.
+//
+// Returns -std::numeric_limits<double>::infinity() when the signal is too
+// short or all blocks fall below the -70 LUFS absolute gate.
+double measure_lufs(const std::vector<float> & wav, int sr);
+
+// Normalise `wav` to `target_lufs` (default -27, which is what
+// chatterbox.tts_turbo.ChatterboxTurboTTS.norm_loudness uses).  Modifies
+// `wav` in-place.  No-op if the measured loudness is ±∞ or the gain is NaN.
+void normalise_lufs(std::vector<float> & wav, int sr, double target_lufs = -27.0);
+
+// -----------------------------------------------------------------------------
 // Mel extraction
 // -----------------------------------------------------------------------------
 

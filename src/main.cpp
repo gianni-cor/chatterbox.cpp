@@ -13,6 +13,10 @@
 #include "ggml-metal.h"
 #endif
 
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -91,6 +95,23 @@ static bool compute_prompt_feat_native(const std::string & wav_path,
         wav = resample_sinc(wav, sr, 24000);
     }
 
+    // Loudness-normalise to -27 LUFS (matches tts_turbo.norm_loudness).  A
+    // quiet reference wav (e.g. -44 LUFS) would otherwise produce mel values
+    // 15–20 dB lower than what S3Gen was trained on, and the conditioning
+    // would pull the output towards the default voice.
+    double pre  = measure_lufs(wav, 24000);
+    normalise_lufs(wav, 24000, -27.0);
+    fprintf(stderr, "voice:   loudness %.2f LUFS → -27 LUFS (+%.2f dB)\n", pre, -27.0 - pre);
+
+    // Match Python's tts_turbo.prepare_conditionals:
+    //   s3gen_ref_wav = s3gen_ref_wav[:DEC_COND_LEN]  # 10 * S3GEN_SR = 240000
+    //   s3gen.embed_ref(s3gen_ref_wav, 24000)  # → prompt_feat/embedding/prompt_token
+    // Trim to the first 10 s at 24 kHz before computing anything, otherwise
+    // prompt_feat comes out (~787, 80) instead of the (500, 80) S3Gen was
+    // trained on, and conditioning suffers.
+    const int dec_cond_samples = 10 * 24000;
+    if ((int)wav.size() > dec_cond_samples) wav.resize(dec_cond_samples);
+
     // Pull the precomputed mel filterbank out of chatterbox-s3gen.gguf.
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
@@ -150,7 +171,17 @@ static bool compute_embedding_native(const std::string & wav_path,
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return false;
+    // Python normalises loudness at the ORIGINAL sample rate, before any
+    // resampling.  Do the same so the gain matches exactly.
+    normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
+
+    // Match Python's s3gen.embed_ref: the reference wav has been trimmed to
+    // DEC_COND_LEN = 10 s @ 24 kHz before being passed in, then internally
+    // resampled to 16 kHz.  Trimming to the equivalent 10 s @ 16 kHz after
+    // resampling gets us the same slice for CAMPPlus (fbank + speaker encoder).
+    const int dec_cond_samples_16k = 10 * 16000;
+    if ((int)wav.size() > dec_cond_samples_16k) wav.resize(dec_cond_samples_16k);
 
     std::vector<float> fbank = fbank_kaldi_80(wav, mel_fb);
     if (fbank.empty()) return false;
@@ -193,6 +224,7 @@ static bool compute_speech_tokens_native(const std::string & wav_path,
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return false;
+    normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
 
     // prompt_token: first 10 s of the reference → up to 250 tokens (S3Gen side).
@@ -480,6 +512,17 @@ static ggml_backend_t init_backend(int n_gpu_layers) {
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_metal_init();
         if (b) { fprintf(stderr, "%s: using Metal backend\n", __func__); return b; }
+    }
+#endif
+#ifdef GGML_USE_VULKAN
+    if (n_gpu_layers > 0) {
+        auto * b = ggml_backend_vk_init(0);
+        if (b) {
+            char desc[256] = {0};
+            ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+            fprintf(stderr, "%s: using Vulkan backend (device 0: %s)\n", __func__, desc);
+            return b;
+        }
     }
 #endif
     auto * b = ggml_backend_cpu_init();
@@ -916,6 +959,7 @@ int main(int argc, char ** argv) {
             opts.seed            = params.seed;
             opts.n_threads       = params.n_threads;
             opts.debug           = params.debug;
+            opts.n_gpu_layers    = params.n_gpu_layers;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -980,6 +1024,7 @@ int main(int argc, char ** argv) {
                 int sr = 0;
                 if (!wav_load(params.reference_audio, wav, sr))
                     throw std::runtime_error("failed to load --reference-audio for VoiceEncoder");
+                normalise_lufs(wav, sr, -27.0);
                 if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
                 if (!voice_encoder_embed(wav, vew, se_data))
                     throw std::runtime_error("VoiceEncoder forward failed");
@@ -1124,6 +1169,7 @@ int main(int argc, char ** argv) {
             opts.seed            = params.seed;
             opts.n_threads       = params.n_threads;
             opts.debug           = params.debug;
+            opts.n_gpu_layers    = params.n_gpu_layers;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
