@@ -2,11 +2,21 @@
 
 **Chatterbox Turbo** (Resemble AI, MIT-licensed zero-shot text-to-speech)
 ported to [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference
-on CPU (Linux/macOS) with no runtime dependency on Python or PyTorch.
+on CPU / Metal / CUDA / Vulkan, with no runtime dependency on Python or
+PyTorch.
+
+Speed on a 10 s sentence (end-to-end, both T3 and S3Gen+HiFT):
+
+| Backend                     | `gen_RTF` | Wall   | vs real-time |
+|-----------------------------|----------:|-------:|-------------:|
+| CPU (10-core EPYC, F16)     | 0.70      | 8.2 s  | 1.4×         |
+| Metal (M3 Ultra, Q4_0)      | 0.14      | 2.0 s  | 7.3×         |
+| Vulkan (RTX 5090, Q4_0)     | 0.06      | < 1 s  | 17.1×        |
 
 See [`PROGRESS.md`](PROGRESS.md) for the full chronological development
-journal, including verification stages, numerical parity results, and the
-optimization pass that got us to **3.6× faster than real-time on CPU**.
+journal, including numerical-parity stages and every optimization pass
+that got us here (T3 Flash Attention, KV-cache layout rework, Metal
+kernel patches, legacy Q4/Q5/Q8 quantization, etc.).
 
 ---
 
@@ -253,18 +263,25 @@ ffplay /tmp/out.wav         # any OS with ffmpeg
   values for the random bits so every stage can be bit-exactly compared
   to PyTorch.
 
-Typical timings on a 10-core EPYC CPU:
+Typical end-to-end timings on a 10 s sentence
+(`gen_RTF = (T3_INFER_MS + S3GEN_INFER_MS) / AUDIO_MS`):
 
-```
->>> [1/2] T3: text -> speech tokens
-    generated 145 speech tokens
->>> [2/2] S3Gen + HiFT: speech tokens -> wav
-Using 10 threads
-  [encoder] 286 ms
-  [cfm_total] 785 ms
-  [hift_total] 1312 ms
-=== pipeline: 2383 ms for 8640 ms of audio (RTF=0.28, 3.6x faster than real-time) ===
-```
+| Backend (weights)           | T3 gen  | S3Gen+HiFT gen | `gen_RTF` | Wall  | vs real-time |
+|-----------------------------|--------:|---------------:|----------:|------:|-------------:|
+| CPU (10-core EPYC, F16)     | 3998 ms | 2905 ms        | 0.70      | 8.2 s | 1.4×         |
+| Metal (M3 Ultra, F16)       |  909 ms |  562 ms        | 0.15      | 2.1 s | 6.7×         |
+| Metal (M3 Ultra, Q4_0)      |  886 ms |  608 ms        | 0.14      | 2.0 s | 7.3×         |
+| Vulkan (RTX 5090, F16)      |  402 ms |  282 ms        | 0.06      | < 1 s | 15.6×        |
+| Vulkan (RTX 5090, Q4_0)     |  347 ms |  284 ms        | 0.06      | < 1 s | 17.1×        |
+
+`Wall` includes GGUF load time; `gen_RTF` is inference only.  Full
+breakdown with CFM / HiFT sub-timings plus an ONNX baseline is in
+[`PROGRESS.md §3.10 / §3.13`](PROGRESS.md).
+
+Note: the binary also prints an inner `=== pipeline: … RTF=… ===` line
+during synthesis.  That RTF covers **only the S3Gen + HiFT phase**
+(it's the timer around `s3gen_synthesize_to_wav`, which runs after T3
+is already done).  The table above reports the full end-to-end number.
 
 ## 4. Optional: validate against PyTorch
 
