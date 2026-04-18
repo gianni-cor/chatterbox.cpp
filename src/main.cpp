@@ -242,6 +242,65 @@ static bool compute_speech_tokens_native(const std::string & wav_path,
     return true;
 }
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
+// Save the five voice-conditioning tensors to a directory as .npy so later
+// runs can reuse them via --ref-dir (no --reference-audio needed), skipping
+// VoiceEncoder / CAMPPlus / S3TokenizerV2 / mel-extract entirely.
+//
+// Any of the five buffers may be empty; missing ones are silently skipped
+// (we emit whatever we have and let the reuse path fall back to built-in
+// or error cleanly if a required tensor is absent).
+static void save_voice_profile(const std::string & dir,
+                               const std::vector<float>   & speaker_emb,
+                               const std::vector<int32_t> & cond_prompt_speech_tokens,
+                               const std::vector<float>   & embedding,
+                               const std::vector<int32_t> & prompt_token,
+                               const std::vector<float>   & prompt_feat,
+                               int prompt_feat_rows /* = pf_data.size() / 80 */)
+{
+    struct stat st;
+    if (::stat(dir.c_str(), &st) != 0) {
+        if (::mkdir(dir.c_str(), 0755) != 0) {
+            fprintf(stderr, "save_voice_profile: cannot create %s\n", dir.c_str());
+            return;
+        }
+    } else if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "save_voice_profile: %s exists but is not a directory\n", dir.c_str());
+        return;
+    }
+
+    int n_saved = 0;
+    if (!speaker_emb.empty()) {
+        npy_save_f32(dir + "/speaker_emb.npy",
+                     {(int64_t)speaker_emb.size()}, speaker_emb.data());
+        ++n_saved;
+    }
+    if (!cond_prompt_speech_tokens.empty()) {
+        npy_save_i32(dir + "/cond_prompt_speech_tokens.npy",
+                     {(int64_t)cond_prompt_speech_tokens.size()},
+                     cond_prompt_speech_tokens.data());
+        ++n_saved;
+    }
+    if (!embedding.empty()) {
+        npy_save_f32(dir + "/embedding.npy",
+                     {(int64_t)embedding.size()}, embedding.data());
+        ++n_saved;
+    }
+    if (!prompt_token.empty()) {
+        npy_save_i32(dir + "/prompt_token.npy",
+                     {(int64_t)prompt_token.size()}, prompt_token.data());
+        ++n_saved;
+    }
+    if (!prompt_feat.empty() && prompt_feat_rows > 0) {
+        npy_save_f32(dir + "/prompt_feat.npy",
+                     {(int64_t)prompt_feat_rows, 80}, prompt_feat.data());
+        ++n_saved;
+    }
+    fprintf(stderr, "save_voice_profile: wrote %d .npy files into %s\n", n_saved, dir.c_str());
+}
+
 static constexpr int CHBX_MAX_NODES = 8192;
 
 // --------------------------------------------------------------------------
@@ -351,6 +410,7 @@ struct cli_params {
     std::string out_wav;         // wav output path (requires --s3gen-gguf)
     std::string ref_dir;         // override built-in voice with .npy reference dump
     std::string reference_audio; // wav file; computes prompt_feat natively in C++
+    std::string save_voice_dir;  // if set, dump the 5 conditioning tensors here for reuse
     bool    debug          = false;  // --debug: load Python-dumped intermediates for validation
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
@@ -385,9 +445,13 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --ref-dir DIR           Override built-in voice with embedding.npy /\n");
     fprintf(stderr, "                          prompt_token.npy / prompt_feat.npy from DIR, plus\n");
     fprintf(stderr, "                          T3 speaker_emb.npy / cond_prompt_speech_tokens.npy.\n");
-    fprintf(stderr, "  --reference-audio PATH  Reference .wav; prompt_feat is computed natively in\n");
-    fprintf(stderr, "                          C++ (replaces ref-dir/prompt_feat.npy). The other\n");
-    fprintf(stderr, "                          four voice tensors still come from --ref-dir.\n");
+    fprintf(stderr, "  --reference-audio PATH  Reference .wav; all five voice-conditioning tensors\n");
+    fprintf(stderr, "                          (speaker_emb, cond_prompt_speech_tokens, embedding,\n");
+    fprintf(stderr, "                          prompt_token, prompt_feat) are computed in C++.\n");
+    fprintf(stderr, "  --save-voice DIR        Dump the 5 computed conditioning tensors as .npy into\n");
+    fprintf(stderr, "                          DIR (created if missing).  Use --ref-dir DIR on later\n");
+    fprintf(stderr, "                          runs to reuse the voice without --reference-audio —\n");
+    fprintf(stderr, "                          skips VoiceEncoder/CAMPPlus/S3TokenizerV2 entirely.\n");
     fprintf(stderr, "  --debug                 Load reference intermediates from --ref-dir for\n");
     fprintf(stderr, "                          bit-exact numerical validation (requires --ref-dir).\n");
     fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
@@ -418,6 +482,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--out")            { auto v = next("--out");            if (!v) return false; params.out_wav = v; }
         else if (arg == "--ref-dir")        { auto v = next("--ref-dir");        if (!v) return false; params.ref_dir = v; }
         else if (arg == "--reference-audio"){ auto v = next("--reference-audio");if (!v) return false; params.reference_audio = v; }
+        else if (arg == "--save-voice")     { auto v = next("--save-voice");     if (!v) return false; params.save_voice_dir = v; }
         else if (arg == "--debug")          { params.debug = true; }
         else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
         else if (arg == "--threads")        { auto v = next("--threads");        if (!v) return false; params.n_threads = std::stoi(v); }
@@ -664,13 +729,26 @@ static ggml_tensor * build_transformer_core(
     const auto & hp = model.hparams;
     const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = hp.n_ctx;
 
-    // Causal attention mask for soft_max_ext. Shape [n_kv, N] broadcast over heads.
-    // We use soft_max_ext instead of diag_mask_inf + soft_max because not every
-    // backend (notably Metal) implements the fused DIAG_MASK_INF op.
-    // For the single-step path (N=1) every KV position is allowed, so no mask is needed.
+    const int HD = n_embd / n_head;
+    const int64_t L = n_past + N;
+
+    // KV cache layout: each layer is interpreted as [HD, n_ctx, n_head] instead
+    // of the older [n_embd, n_ctx].  The total size is unchanged (HD*n_ctx*n_head
+    // == n_embd*n_ctx), but new-in-[seq, head] stride lets ggml_flash_attn_ext
+    // read the K/V slice as a [HD, L, n_head] view without a per-step
+    // permute+cont — which was the main reason an earlier FA attempt regressed
+    // on the T3 step path.
+    const size_t kv_layer_elems  = (size_t) HD * n_ctx * n_head;  // same as n_embd * n_ctx
+    const size_t kv_head_stride  = (size_t) HD * n_ctx * sizeof(float);
+    const size_t kv_pos_stride   = (size_t) HD * sizeof(float);
+
+    // Causal attention mask for flash_attn_ext.  Shape [n_kv, N] broadcast
+    // over heads, F16 (Metal FA requires F16 masks; CPU / CUDA / Vulkan all
+    // accept that too).  For the single-step path (N=1) every KV position is
+    // allowed, so no mask is needed and we pass nullptr to FA.
     ggml_tensor * kq_mask = nullptr;
     if (N > 1) {
-        kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_past + N, N);
+        kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, L, N);
         ggml_set_name(kq_mask, "kq_mask");
         ggml_set_input(kq_mask);
     }
@@ -682,42 +760,65 @@ static ggml_tensor * build_transformer_core(
         cur = ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_attn_attn_w, cur), model.layers[il].c_attn_attn_b);
 
         ggml_tensor * Qcur = ggml_view_2d(ctx, cur, n_embd, N, cur->nb[1], 0*sizeof(float)*n_embd);
-        ggml_tensor * Kcur = ggml_view_2d(ctx, cur, n_embd, N, cur->nb[1], 1*sizeof(float)*n_embd);
-        ggml_tensor * Vcur = ggml_view_2d(ctx, cur, n_embd, N, cur->nb[1], 2*sizeof(float)*n_embd);
 
+        // KV cache append: write [n_embd, N] into cache as [HD, N, n_head]
+        // rows sitting at positions [n_past, n_past+N).  Source is viewed as
+        // [HD, n_head, N] and permuted to [HD, N, n_head] so ggml_cpy writes
+        // into the strided destination one kernel launch per tensor.
         {
-            ggml_tensor * k = ggml_view_1d(ctx, model.memory_k, (int64_t)N*n_embd,
-                (size_t)ggml_element_size(model.memory_k)*n_embd*((size_t)il*n_ctx+n_past));
-            ggml_tensor * v = ggml_view_1d(ctx, model.memory_v, (int64_t)N*n_embd,
-                (size_t)ggml_element_size(model.memory_v)*n_embd*((size_t)il*n_ctx+n_past));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur, k));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur, v));
+            const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
+
+            ggml_tensor * Kcur_3d = ggml_view_3d(ctx, cur,
+                HD, n_head, N,
+                (size_t) HD * sizeof(float),  // nb1: stride between head rows within one column
+                cur->nb[1],                   // nb2: stride between N columns (original cur stride)
+                (size_t) n_embd * sizeof(float));  // skip Qcur
+            ggml_tensor * Vcur_3d = ggml_view_3d(ctx, cur,
+                HD, n_head, N,
+                (size_t) HD * sizeof(float),
+                cur->nb[1],
+                (size_t) 2 * n_embd * sizeof(float));
+
+            ggml_tensor * Kcur_KNH = ggml_permute(ctx, Kcur_3d, 0, 2, 1, 3);
+            ggml_tensor * Vcur_KNH = ggml_permute(ctx, Vcur_3d, 0, 2, 1, 3);
+
+            ggml_tensor * k_dst = ggml_view_3d(ctx, model.memory_k,
+                HD, N, n_head,
+                kv_pos_stride,
+                kv_head_stride,
+                layer_off + (size_t) n_past * kv_pos_stride);
+            ggml_tensor * v_dst = ggml_view_3d(ctx, model.memory_v,
+                HD, N, n_head,
+                kv_pos_stride,
+                kv_head_stride,
+                layer_off + (size_t) n_past * kv_pos_stride);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_KNH, k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_KNH, v_dst));
         }
 
-        ggml_tensor * Q = ggml_permute(ctx, ggml_cont_3d(ctx, Qcur, n_embd/n_head, n_head, N), 0,2,1,3);
-        ggml_tensor * K = ggml_permute(ctx,
-            ggml_reshape_3d(ctx,
-                ggml_view_1d(ctx, model.memory_k, (int64_t)(n_past+N)*n_embd,
-                    (size_t)il*n_ctx*ggml_element_size(model.memory_k)*n_embd),
-                n_embd/n_head, n_head, n_past+N),
-            0,2,1,3);
+        // Q: the one tensor that still needs a cont (it's a strided view of
+        // the fused QKV output).  K and V are strided views of the cache and
+        // flash_attn_ext consumes them directly without a per-step copy.
+        ggml_tensor * Q = ggml_cont(ctx,
+            ggml_permute(ctx, ggml_cont_3d(ctx, Qcur, HD, n_head, N), 0, 2, 1, 3));
 
-        ggml_tensor * KQ = ggml_soft_max_ext(ctx,
-            ggml_mul_mat(ctx, K, Q),
-            kq_mask,
-            1.0f/std::sqrt((float)n_embd/n_head),
-            0.0f);
+        const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
+        ggml_tensor * K = ggml_view_3d(ctx, model.memory_k,
+            HD, L, n_head,
+            kv_pos_stride,
+            kv_head_stride,
+            layer_off);
+        ggml_tensor * V = ggml_view_3d(ctx, model.memory_v,
+            HD, L, n_head,
+            kv_pos_stride,
+            kv_head_stride,
+            layer_off);
 
-        ggml_tensor * V_trans = ggml_cont_3d(ctx,
-            ggml_permute(ctx,
-                ggml_reshape_3d(ctx,
-                    ggml_view_1d(ctx, model.memory_v, (int64_t)(n_past+N)*n_embd,
-                        (size_t)il*n_ctx*ggml_element_size(model.memory_v)*n_embd),
-                    n_embd/n_head, n_head, n_past+N),
-                1,2,0,3),
-            n_past+N, n_embd/n_head, n_head);
-
-        cur = ggml_cont_2d(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, V_trans, KQ), 0,2,1,3), n_embd, N);
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, kq_mask,
+            1.0f / std::sqrt((float) HD), 0.0f, 0.0f);
+        // attn: [HD, n_head, N, 1] contiguous -> [n_embd, N]
+        cur = ggml_reshape_2d(ctx, attn, n_embd, N);
         cur = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_attn_proj_w, cur), model.layers[il].c_attn_proj_b), inpL);
 
         ggml_tensor * inpFF = cur;
@@ -822,13 +923,16 @@ static bool eval_prompt(
         const int N = prompt_len;
         ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
         if (kq_mask) {
-            std::vector<float> mask((size_t)N * N, 0.0f);
+            // Metal FA requires F16 masks; other backends accept F16 too.
+            const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+            std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
             for (int q = 0; q < N; ++q) {
                 for (int k = 0; k < N; ++k) {
-                    if (k > q) mask[(size_t)q * N + k] = -INFINITY;
+                    if (k > q) mask[(size_t)q * N + k] = ninf_h;
                 }
             }
-            ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(float));
+            ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
         }
     }
 

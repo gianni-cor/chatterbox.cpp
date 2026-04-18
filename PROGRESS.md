@@ -43,11 +43,13 @@ Plus `scripts/synthesize.sh` which composes the two into a single command.
 | Backend                     | `gen_RTF` | Wall  | vs ONNX addon |
 |-----------------------------|----------:|------:|--------------:|
 | CPU (10-core EPYC, F16)     | 0.70      | 8.2 s | 3.6× faster   |
-| **Vulkan (RTX 5090, Q4_0)** | **0.08**  | **1.8 s** | **7.8×** |
-| **Metal (M3 Ultra, Q4_0)**  | **0.18**  | **2.4 s** | **5.9×** |
+| **Vulkan (RTX 5090, Q4_0)** | **0.06**  | **1.8 s** | **7.8×** |
+| **Metal (M3 Ultra, Q4_0)**  | **0.14**  | **2.1 s** | **6.7×** |
 | ONNX q4 addon (CPU baseline) | 1.06     | 13.9 s | 1.0×         |
 
-GPU support and Metal kernel fixes are described in §3.11 and §3.12.
+GPU support and Metal kernel fixes are described in §3.11 / §3.12;
+the layout-friendly KV cache + Flash Attention pass that produced the
+numbers in this table is in §3.13.
 
 ---
 
@@ -644,6 +646,66 @@ for this, so the patch is tiny and easy to drop once upstream picks
 up equivalent fixes; see `patches/README.md` for what to do in that
 case.
 
+### 3.13  T3 Flash Attention with a layout-friendly KV cache
+
+After §3.11 / §3.12 the dominant wall-clock cost in Chatterbox became
+T3's autoregressive step (≈ 1.3 s of a ~2.4 s run on Metal M3 Ultra
+Q4_0).  An earlier attempt to swap the explicit
+`soft_max_ext(mul_mat(K,Q), mask) + mul_mat(V_trans)` chain for
+`ggml_flash_attn_ext` ran into a deal-breaker: the KV cache was laid
+out `[HD, n_head, n_ctx]` per layer but `flash_attn_ext` wants
+`[HD, n_ctx, n_head]`.  Every step had to `ggml_cont(ggml_permute(K))`
+over a tensor that grew with `n_past`, and the extra kernel dispatches
+wiped out FA's savings.
+
+Fix: store the cache the way FA reads it.
+
+- Same total size per layer (`HD * n_ctx * n_head` == `n_embd * n_ctx`),
+  so no allocation changes.
+- Write path (step or prompt): Kcur / Vcur are viewed as
+  `[HD, n_head, N]`, permuted to `[HD, N, n_head]`, then one
+  `ggml_cpy` per tensor into a strided cache view at
+  `[HD, n_past:n_past+N, n_head]`.  For the step path N=1 the permute
+  is a no-op in memory.
+- Read path: `ggml_view_3d(memory_k, HD, L, n_head, nb=[4, HD*4,
+  HD*n_ctx*4], offset=il*layer_size)` is exactly the shape FA needs,
+  with no `permute + cont`.
+- Mask: switched from F32 to F16 (ggml FA requires F16 on Metal;
+  other backends accept it too).  N=1 path passes `nullptr` since
+  every KV position is in the past.
+
+Measured on M3 Ultra, same 10 s sentence, seed 42, `--threads 20`,
+`--n-gpu-layers 99`, averaged over 3 warm runs:
+
+| Variant  | T3 infer before | T3 infer after | Δ     | Wall before | Wall after | `gen_RTF` |
+|----------|----------------:|---------------:|------:|------------:|-----------:|----------:|
+| F16      |          1372 ms|         983 ms | −28 % |      2.51 s |     2.15 s | 0.189 → 0.157 |
+| Q8_0     |          1371 ms|         985 ms | −28 % |      2.48 s |     2.12 s | 0.182 → 0.149 |
+| Q5_0     |          1445 ms|        1063 ms | −26 % |      2.51 s |     2.18 s | 0.186 → 0.152 |
+| **Q4_0** |      **1274 ms**|     **965 ms** | **−24 %** | **2.36 s** | **2.06 s** | **0.176 → 0.144** |
+
+And the same change on Vulkan 5090 (Linux remote):
+
+| Variant  | T3 infer before | T3 infer after | Δ     |
+|----------|----------------:|---------------:|------:|
+| F16      |           600 ms|         410 ms | −32 % |
+| Q4_0     |           522 ms|         356 ms | −32 % |
+
+So the new layout is not just a Metal-shaped win — it speeds up every
+GPU backend, because the previous `permute + cont` per layer per step
+was cheap on NVIDIA too but not free.  CPU builds see a similar graph
+shape (fewer intermediate nodes) and stay neutral.
+
+Output sampling is *not* bit-exact against the old path: FA runs its
+own internal reductions in different order and the mask lives in F16
+instead of F32, so token counts can shift by ±2 % (e.g. F16 went from
+248 → 244 tokens on the bench prompt).  Audio remains perceptually
+identical; this is the same kind of drift that moving to FA causes
+anywhere else in ggml.
+
+Committed as part of the Metal optimization sequence alongside the
+earlier `patches/ggml-metal-chatterbox-ops.patch`.
+
 ### Cross-backend summary
 
 Same 10 s sentence, seed 42, `gen_RTF` is inference-only (excludes
@@ -652,10 +714,10 @@ load time):
 | Backend (weights)             | T3 gen | S3Gen gen | `gen_RTF` | Wall  | Real-time mult |
 |-------------------------------|-------:|----------:|----------:|------:|---------------:|
 | CPU Linux (F16, 8 threads)    | 3998 ms | 2905 ms   | 0.70      | 8.17 s | 1.4×          |
-| Vulkan 5090 (F16)             |  600 ms |  279 ms   | 0.08      | 2.10 s | 12.0×         |
-| Vulkan 5090 (Q4_0)            |  522 ms |  275 ms   | 0.08      | 1.78 s | 13.0×         |
-| Metal M3 Ultra (F16)          | 1326 ms |  577 ms   | 0.19      | 2.51 s | 5.3×          |
-| Metal M3 Ultra (Q4_0)         | 1274 ms |  594 ms   | 0.18      | 2.36 s | 5.6×          |
+| Vulkan 5090 (F16)             |  410 ms |  278 ms   | 0.065     | —       | 15.4×         |
+| Vulkan 5090 (Q4_0)            |  356 ms |  276 ms   | 0.059     | 1.78 s | 17.0×         |
+| Metal M3 Ultra (F16)          |  983 ms |  564 ms   | 0.157     | 2.15 s | 6.4×          |
+| Metal M3 Ultra (Q4_0)         |  965 ms |  608 ms   | 0.144     | 2.06 s | 6.9×          |
 | ONNX q4 addon (CPU, Linux)    |     — (not exposed) |     — | 1.06      | 13.91 s | 0.94×        |
 
 The ONNX addon is shown as a baseline because it's what

@@ -121,6 +121,68 @@ inline const int32_t * npy_as_i32(const npy_array & a) {
     return reinterpret_cast<const int32_t*>(a.data.data());
 }
 
+// Minimal NumPy .npy writer (v1.0 little-endian).  Handles the types our C++
+// voice-conditioning tensors actually use: float32 and int32 with arbitrary
+// shape.  No Fortran order, no object dtype.  Output is byte-identical to
+// what `np.save(path, np.ascontiguousarray(arr))` produces for these dtypes.
+inline void npy_save(const std::string & path,
+                     const std::string & dtype,           // "<f4" or "<i4"
+                     const std::vector<int64_t> & shape,
+                     const void * data,
+                     size_t elem_size)
+{
+    // Build the header dict.
+    std::string shape_str;
+    if (shape.empty()) {
+        shape_str = "()";
+    } else {
+        shape_str = "(";
+        for (size_t i = 0; i < shape.size(); ++i) {
+            shape_str += std::to_string(shape[i]);
+            if (shape.size() == 1 || i + 1 < shape.size()) shape_str += ",";
+            if (i + 1 < shape.size()) shape_str += " ";
+        }
+        shape_str += ")";
+    }
+    std::string header = "{'descr': '" + dtype + "', 'fortran_order': False, 'shape': "
+                       + shape_str + ", }";
+    // Pad header so (10 bytes magic+version+hdr_len) + header.size() + 1 ('\n')
+    // is a multiple of 64 bytes (NumPy padding rule).
+    const size_t preamble = 10;
+    size_t total = preamble + header.size() + 1;
+    while (total % 64 != 0) { header += ' '; ++total; }
+    header += '\n';
+
+    if (header.size() > 0xFFFF)
+        throw std::runtime_error("npy_save: header too large for v1.0 format");
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("npy_save: cannot open " + path);
+    f.write("\x93NUMPY", 6);
+    uint8_t v_major = 1, v_minor = 0;
+    f.write((const char*)&v_major, 1);
+    f.write((const char*)&v_minor, 1);
+    uint16_t hlen = (uint16_t)header.size();
+    f.write((const char*)&hlen, 2);
+    f.write(header.data(), header.size());
+
+    size_t n_elem = 1;
+    for (auto d : shape) n_elem *= (size_t)d;
+    f.write((const char*)data, n_elem * elem_size);
+}
+
+inline void npy_save_f32(const std::string & path,
+                         const std::vector<int64_t> & shape,
+                         const float * data) {
+    npy_save(path, "<f4", shape, data, 4);
+}
+
+inline void npy_save_i32(const std::string & path,
+                         const std::vector<int64_t> & shape,
+                         const int32_t * data) {
+    npy_save(path, "<i4", shape, data, 4);
+}
+
 struct compare_stats {
     double max_abs_err = 0;
     double mean_abs_err = 0;
