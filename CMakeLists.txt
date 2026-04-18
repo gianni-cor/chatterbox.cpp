@@ -10,7 +10,11 @@ add_subdirectory(ggml)
 # Unified end-to-end binary: text -> speech tokens (T3) -> wav (S3Gen + HiFT).
 # Sources: T3 runner (main.cpp) + BPE tokenizer + S3Gen/HiFT pipeline
 # (chatterbox_tts.cpp, wrapped as the s3gen_synthesize_to_wav entry point).
-add_executable(chatterbox src/main.cpp src/gpt2_bpe.cpp src/chatterbox_tts.cpp)
+add_executable(chatterbox
+    src/main.cpp
+    src/gpt2_bpe.cpp
+    src/chatterbox_tts.cpp
+    src/voice_features.cpp)
 target_link_libraries(chatterbox PRIVATE ggml)
 target_include_directories(chatterbox PRIVATE ggml/include src)
 

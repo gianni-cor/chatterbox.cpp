@@ -149,16 +149,21 @@ Advanced modes:
   ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
                      --ref-dir voices/me/ \
+                     --reference-audio me.wav \
                      --text "Hello in my voice." \
                      --out out.wav
   ```
 
   `voices/me/` holds five `.npy` tensors (speaker embedding + prompt
   tokens + prompt mel for T3 and S3Gen respectively). Reference audio
-  needs to be at least 5 s of clean speech; longer helps. The
-  preprocessing script is a Python-side bridge for now — native C++
-  VoiceEncoder / mel-extractor / S3TokenizerV2 are on the backlog
-  (see `PROGRESS.md` A1 phase 2+).
+  needs to be at least 5 s of clean speech; longer helps.
+
+  `--reference-audio me.wav` is optional: when set, the C++ binary
+  computes `prompt_feat` natively (WAV load + Kaiser-windowed sinc
+  resample to 24 kHz + 80-channel log-mel) and ignores
+  `voices/me/prompt_feat.npy`. The other four voice tensors still come
+  from the Python helper for now; native `VoiceEncoder` / `CAMPPlus` /
+  `S3TokenizerV2` are on the backlog (`PROGRESS.md` A1 phases 2c-2e).
 
 Play the result:
 

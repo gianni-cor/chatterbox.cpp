@@ -521,30 +521,92 @@ Verified end-to-end on the remote EPYC: override prints
 cond_prompt_tokens=260)`, the synthesis runs at RTF 0.44, the output
 wav plays back cleanly on the Mac.
 
-**Phase 2 (NEXT)** — C++ mel extraction for `prompt_feat`:
+**Phase 2a (DONE)** — C++ WAV I/O + sinc resampler + 80-ch log-mel at 24 kHz:
 
-- 80-channel log-mel at 24 kHz, hop 256, win 1024 (to match
-  `s3gen.mel_extractor`).
-- STFT code from the HiFT port is reusable; mel filterbank is a
-  `[80, n_fft/2+1]` matrix that `librosa.filters.mel` computes and we
-  can bake into the s3gen GGUF as a single tensor, then mul_mat over
-  the magnitude spectrogram.
-- Tiny — expect ~150 lines of C++ + a converter-side export of the
-  pre-computed filterbank.
+- `src/dr_wav.h` (public-domain single header, MIT-0 fallback) vendored
+  as a bundled WAV loader (all PCM variants, any sample rate,
+  auto-mono).
+- `src/voice_features.{h,cpp}`: `wav_load`, `resample_sinc`
+  (Kaiser-windowed, beta=8.6, configurable tap count), and
+  `mel_extract_24k_80`. The mel extractor is a direct port of
+  `s3gen.utils.mel.mel_spectrogram` (`n_fft=1920`, `hop=480`,
+  `win=1920`, `fmin=0`, `fmax=8000`, `center=False`, reflect-pad 720).
+- `scripts/convert-s3gen-to-gguf.py` now also bakes in the precomputed
+  librosa mel filterbank (`librosa.filters.mel(sr=24000, n_fft=1920,
+  n_mels=80, fmin=0, fmax=8000)`, a `(80, 961)` float32 matrix) as
+  `s3gen/mel_fb/24k_80`. Runtime has no librosa dep.
+- Two validation binaries: `test-resample` (24 kHz → 48 kHz → 24 kHz
+  round-trip on a 4-tone signal, expects **> 60 dB SNR**) and
+  `test-voice-features MODEL.gguf REF.wav PROMPT_FEAT.npy` (compares
+  C++ 80-ch log-mel against a Python-dumped `prompt_feat.npy`).
 
-**Phase 3** — C++ VoiceEncoder (3-layer unidirectional LSTM, 40-channel
-16 kHz mel in, 256-d speaker embedding out). LSTM cell + recurrence in
-ggml follows the `whisper.cpp` / `bark.cpp` patterns. The partial-window
-averaging from `VoiceEncoder.inference` is CPU-side bookkeeping.
+Measured on 10-core EPYC:
 
-**Phase 4** — C++ S3TokenizerV2 (~600-line wav2vec-style encoder with
-FSMN attention and an FSQ codebook). This is the biggest lift and will
-probably need staged verification against Python dumps, same approach
-as the S3Gen encoder port in §3.3. Produces both the T3
-`cond_prompt_speech_tokens` and the S3Gen `prompt_token`.
+| Check                                            | Result |
+|---|---|
+| Resampler round-trip (4-tone, 24k ↔ 48k)         | **95.75 dB SNR** |
+| Mel parity vs Python `prompt_feat.npy` (rel)     | **8.3e-08**      |
 
-After all three phases land, `scripts/prepare-voice.py` becomes
-redundant and `chatterbox --reference-audio file.wav ...` replaces it.
+(The ~500-frame Python reference truncates at DEC_COND_LEN = 10 s; the
+C++ side produces an extra ~20 frames for a 10.4 s input wav but the
+overlapping 500 × 80 values match to float precision.)
+
+Implementation notes:
+
+- First attempt at `resample_sinc` was a polyphase decomposition with
+  a Kaiser-windowed sinc prototype; the phase-indexing convention was
+  subtly wrong and gave **0 dB SNR** on the round-trip. Swapped for
+  straightforward "fractional-index sinc interpolation at each output
+  sample" which is correct and still fast enough for one-shot voice
+  preprocessing.
+- `mel_extract_24k_80` uses a naive O(n_fft) DFT per frame, not an FFT.
+  For a 10 s reference that's ~520 frames × 1920 × 961 ≈ 960 M mults,
+  well under 2 s on CPU. Fine for preprocessing; an FFT is a trivial
+  follow-up if this ever needs to be streaming.
+
+**Phase 2b (DONE)** — `--reference-audio PATH.wav` wired into `main.cpp`.
+The CLI now accepts a reference wav, runs the whole WAV→prompt_feat
+chain in C++, and injects the result into `s3gen_synthesize_opts`
+(new `prompt_feat_override` field) so the S3Gen+HiFT pipeline consumes
+it directly — no temp file, no npy round-trip. The other four voice
+tensors still come from `--ref-dir` for now.
+
+User workflow:
+
+```bash
+python scripts/prepare-voice.py --ref-audio me.wav --out voices/me/
+./build/chatterbox \
+    --model models/chatterbox-t3-turbo.gguf \
+    --s3gen-gguf models/chatterbox-s3gen.gguf \
+    --ref-dir voices/me/ \
+    --reference-audio me.wav \
+    --text "Voice-cloned with C++ mel." \
+    --out out.wav
+```
+
+Verified end-to-end: `voice: prompt_feat shape=(520, 80)` /
+`prompt_feat: using C++ override (520 mel frames)` / audible cloned
+voice at RTF 0.76 on 10-core EPYC.
+
+**Phase 2c (NEXT)** — C++ VoiceEncoder (3-layer unidirectional LSTM,
+40-channel 16 kHz mel in, 256-d speaker embedding out). LSTM cell +
+recurrence in ggml follows the `whisper.cpp` / `bark.cpp` patterns.
+The partial-window averaging from `VoiceEncoder.inference` is CPU-side
+bookkeeping.
+
+**Phase 2d** — C++ CAMPPlus (TDNN + stats pooling speaker encoder,
+80-ch Fbank at 16 kHz → 192-d `embedding`). ~400-line Python, mostly
+dilated 1-D conv stacks; mean/std pooling is trivial to implement.
+
+**Phase 2e** — C++ S3TokenizerV2 (~600-line wav2vec-style encoder
+with FSMN attention + FSQ codebook). Biggest lift; needs stage-by-stage
+verification against Python dumps (same approach as S3Gen encoder port
+in §3.3). Produces both the T3 `cond_prompt_speech_tokens` and the
+S3Gen `prompt_token` streams.
+
+When 2c-2e all land, `scripts/prepare-voice.py` becomes redundant and
+`chatterbox --reference-audio file.wav ...` runs the whole voice
+cloning pipeline in pure C++.
 
 Impact: even Phase 1 alone unlocks "zero-shot voice cloning" as a usable
 feature — the flagship reason anyone picks Chatterbox in the first

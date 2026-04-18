@@ -1154,14 +1154,22 @@ int s3gen_synthesize_to_wav(
         fprintf(stderr, "Loading ref dict from %s\n", ref_dir.c_str());
         npy_array emb_npy = npy_load(ref_dir + "/embedding.npy");
         npy_array pt_npy  = npy_load(ref_dir + "/prompt_token.npy");
-        npy_array pf_npy  = npy_load(ref_dir + "/prompt_feat.npy");
         emb_data.assign((const float*)emb_npy.data.data(),
                         (const float*)emb_npy.data.data() + emb_npy.n_elements());
         pt_data.assign((const int32_t*)pt_npy.data.data(),
                        (const int32_t*)pt_npy.data.data() + pt_npy.n_elements());
-        pf_data.assign((const float*)pf_npy.data.data(),
-                       (const float*)pf_npy.data.data() + pf_npy.n_elements());
-        pf_rows = (int)pf_npy.shape[0];
+        // prompt_feat can be supplied either from the ref_dir npy or as an
+        // in-memory override (e.g. computed from --reference-audio by main).
+        if (!opts.prompt_feat_override.empty()) {
+            pf_data = opts.prompt_feat_override;
+            pf_rows = opts.prompt_feat_rows_override;
+            fprintf(stderr, "  prompt_feat: using C++ override (%d mel frames)\n", pf_rows);
+        } else {
+            npy_array pf_npy = npy_load(ref_dir + "/prompt_feat.npy");
+            pf_data.assign((const float*)pf_npy.data.data(),
+                           (const float*)pf_npy.data.data() + pf_npy.n_elements());
+            pf_rows = (int)pf_npy.shape[0];
+        }
     }
 
     fprintf(stderr, "Speech tokens: %zu\n", speech_tokens.size());

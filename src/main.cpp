@@ -30,12 +30,58 @@
 
 #include "s3gen_pipeline.h"
 #include "npy.h"
+#include "voice_features.h"
+#include "gguf.h"
 
 #include <sys/stat.h>
 
 static bool file_exists(const std::string & path) {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// Load REF.wav, resample to 24 kHz if needed, pull the 80-ch mel filterbank out
+// of the s3gen GGUF, and compute prompt_feat (log-mel) in C++.  out_rows is the
+// number of mel frames (= T_mel in the row-major (T_mel, 80) layout).
+static bool compute_prompt_feat_native(const std::string & wav_path,
+                                       const std::string & s3gen_gguf_path,
+                                       std::vector<float> & out_feat,
+                                       int & out_rows)
+{
+    fprintf(stderr, "voice: loading %s\n", wav_path.c_str());
+    std::vector<float> wav;
+    int sr = 0;
+    if (!wav_load(wav_path, wav, sr)) return false;
+    fprintf(stderr, "voice:   sr=%d samples=%zu (%.2f s)\n", sr, wav.size(), (double)wav.size() / sr);
+    if (sr != 24000) {
+        fprintf(stderr, "voice: resampling %d -> 24000\n", sr);
+        wav = resample_sinc(wav, sr, 24000);
+    }
+
+    // Pull the precomputed mel filterbank out of chatterbox-s3gen.gguf.
+    ggml_context * tmp_ctx = nullptr;
+    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
+    if (!g) {
+        fprintf(stderr, "voice: failed to open %s\n", s3gen_gguf_path.c_str());
+        return false;
+    }
+    ggml_tensor * fb = ggml_get_tensor(tmp_ctx, "s3gen/mel_fb/24k_80");
+    if (!fb) {
+        fprintf(stderr, "voice: s3gen/mel_fb/24k_80 missing from GGUF; re-run convert-s3gen-to-gguf.py\n");
+        gguf_free(g); if (tmp_ctx) ggml_free(tmp_ctx);
+        return false;
+    }
+    std::vector<float> mel_fb(ggml_nelements(fb));
+    std::memcpy(mel_fb.data(), ggml_get_data(fb), ggml_nbytes(fb));
+    gguf_free(g);
+    if (tmp_ctx) ggml_free(tmp_ctx);
+
+    out_feat = mel_extract_24k_80(wav, mel_fb);
+    if (out_feat.empty()) return false;
+    out_rows = (int)(out_feat.size() / 80);
+    fprintf(stderr, "voice: prompt_feat shape=(%d, 80)\n", out_rows);
+    return true;
 }
 
 static constexpr int CHBX_MAX_NODES = 8192;
@@ -146,6 +192,7 @@ struct cli_params {
     std::string s3gen_gguf;      // enables full text → wav pipeline
     std::string out_wav;         // wav output path (requires --s3gen-gguf)
     std::string ref_dir;         // override built-in voice with .npy reference dump
+    std::string reference_audio; // wav file; computes prompt_feat natively in C++
     bool    debug          = false;  // --debug: load Python-dumped intermediates for validation
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
@@ -178,7 +225,11 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --s3gen-gguf PATH       Enables the full text -> wav pipeline (S3Gen + HiFT).\n");
     fprintf(stderr, "  --out PATH              Output wav file when --s3gen-gguf is set.\n");
     fprintf(stderr, "  --ref-dir DIR           Override built-in voice with embedding.npy /\n");
-    fprintf(stderr, "                          prompt_token.npy / prompt_feat.npy from DIR.\n");
+    fprintf(stderr, "                          prompt_token.npy / prompt_feat.npy from DIR, plus\n");
+    fprintf(stderr, "                          T3 speaker_emb.npy / cond_prompt_speech_tokens.npy.\n");
+    fprintf(stderr, "  --reference-audio PATH  Reference .wav; prompt_feat is computed natively in\n");
+    fprintf(stderr, "                          C++ (replaces ref-dir/prompt_feat.npy). The other\n");
+    fprintf(stderr, "                          four voice tensors still come from --ref-dir.\n");
     fprintf(stderr, "  --debug                 Load reference intermediates from --ref-dir for\n");
     fprintf(stderr, "                          bit-exact numerical validation (requires --ref-dir).\n");
     fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
@@ -208,6 +259,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--s3gen-gguf")     { auto v = next("--s3gen-gguf");     if (!v) return false; params.s3gen_gguf = v; }
         else if (arg == "--out")            { auto v = next("--out");            if (!v) return false; params.out_wav = v; }
         else if (arg == "--ref-dir")        { auto v = next("--ref-dir");        if (!v) return false; params.ref_dir = v; }
+        else if (arg == "--reference-audio"){ auto v = next("--reference-audio");if (!v) return false; params.reference_audio = v; }
         else if (arg == "--debug")          { params.debug = true; }
         else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
         else if (arg == "--threads")        { auto v = next("--threads");        if (!v) return false; params.n_threads = std::stoi(v); }
@@ -730,6 +782,12 @@ int main(int argc, char ** argv) {
             opts.seed            = params.seed;
             opts.n_threads       = params.n_threads;
             opts.debug           = params.debug;
+            if (!params.reference_audio.empty()) {
+                if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
+                                                opts.prompt_feat_override,
+                                                opts.prompt_feat_rows_override))
+                    throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
+            }
             return s3gen_synthesize_to_wav(speech_tokens, opts);
         }
 
@@ -861,6 +919,12 @@ int main(int argc, char ** argv) {
             opts.seed            = params.seed;
             opts.n_threads       = params.n_threads;
             opts.debug           = params.debug;
+            if (!params.reference_audio.empty()) {
+                if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
+                                                opts.prompt_feat_override,
+                                                opts.prompt_feat_rows_override))
+                    throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
+            }
             int rc = s3gen_synthesize_to_wav(generated, opts);
             if (rc != 0) return rc;
         } else {

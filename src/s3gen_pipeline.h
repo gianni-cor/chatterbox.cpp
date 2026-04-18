@@ -20,6 +20,14 @@ struct s3gen_synthesize_opts {
     // this directory.
     std::string ref_dir;
 
+    // Optional: if non-empty, override the prompt_feat tensor (S3Gen reference
+    // mel spectrogram) with these values instead of loading it from
+    // ref_dir/prompt_feat.npy or from s3gen/builtin. Layout is row-major
+    // (T_mel, 80). Used by --reference-audio in main.cpp to inject a mel
+    // computed natively in C++ from a reference wav.
+    std::vector<float> prompt_feat_override;
+    int prompt_feat_rows_override = 0;
+
     int  seed      = 42;
     int  n_threads = 0;          // 0 = hardware_concurrency
     int  sr        = 24000;
