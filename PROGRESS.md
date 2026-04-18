@@ -44,7 +44,7 @@ Plus `scripts/synthesize.sh` which composes the two into a single command.
 |-----------------------------|----------:|------:|--------------:|
 | CPU (10-core EPYC, F16)     | 0.70      | 8.2 s | 3.6× faster   |
 | **Vulkan (RTX 5090, Q4_0)** | **0.06**  | **1.8 s** | **7.8×** |
-| **Metal (M3 Ultra, Q4_0)**  | **0.14**  | **2.1 s** | **6.7×** |
+| **Metal (M3 Ultra, Q4_0)**  | **0.14**  | **2.0 s** | **7.0×** |
 | ONNX q4 addon (CPU baseline) | 1.06     | 13.9 s | 1.0×         |
 
 GPU support and Metal kernel fixes are described in §3.11 / §3.12;
@@ -706,6 +706,49 @@ anywhere else in ggml.
 Committed as part of the Metal optimization sequence alongside the
 earlier `patches/ggml-metal-chatterbox-ops.patch`.
 
+### 3.14  Zero-cont Q view via strided QKV access
+
+After §3.13, each T3 attention layer still did two `ggml_cont`s on Q
+per step: one `cont_3d` to densify the strided view of `Qcur`, and an
+outer `cont` after the head-permute.  Both turn into
+`kernel_cpy_f32_f32` dispatches on Metal.
+
+Observation: the entire QKV output `cur` is already contiguous.  Q,
+K, and V are just fixed byte offsets into the same tensor (0,
+`n_embd * 4`, `2 * n_embd * 4` respectively).  With Metal's
+`flash_attn_ext` accepting non-contiguous Q via explicit strides (the
+same flexibility I used for K/V in §3.13), I can drop both conts and
+express Q directly as a `ggml_view_3d` with layout `[HD, N, n_head]`:
+
+```
+nb0 = 4, nb1 = 3 * n_embd * sizeof(float), nb2 = HD * sizeof(float)
+```
+
+Same trick for the Kcur/Vcur sources that go into the KV-cache write
+path — one view each, no permute + cont pair.
+
+Removes 24 kernel dispatches per step (`cont` × 24 layers); since T3
+step time on Metal is almost entirely dispatch-bound at ~9 µs each,
+this shows up straight in the numbers.
+
+Measured on M3 Ultra (same 10 s sentence, seed 42, 3-run warm average):
+
+| Variant  | T3 infer §3.13 | T3 infer §3.14 | Δ     | Wall §3.13 | Wall §3.14 |
+|----------|---------------:|---------------:|------:|-----------:|-----------:|
+| F16      |         983 ms |         909 ms | −7.5% |    2.15 s  |   **2.08 s** |
+| Q8_0     |         985 ms |         906 ms | −8.0% |    2.12 s  |   **2.03 s** |
+| Q5_0     |        1063 ms |         984 ms | −7.4% |    2.18 s  |   **2.09 s** |
+| **Q4_0** |     **965 ms** |     **886 ms** | **−8.2%** | **2.06 s** | **1.98 s** |
+
+Vulkan RTX 5090 sees <3 % change in T3 infer — dispatch overhead is
+much smaller there relative to the actual compute, so there's less to
+save.  No regression on Vulkan, and the code simplifies.  CPU stays
+neutral (same graph topology, fewer intermediate nodes).
+
+Sampling output is not bit-exact against §3.13 either — same reason as
+before, FA reductions are sensitive to operand stride.  Token counts
+shift within ±1 % at the same seed.
+
 ### Cross-backend summary
 
 Same 10 s sentence, seed 42, `gen_RTF` is inference-only (excludes
@@ -714,10 +757,10 @@ load time):
 | Backend (weights)             | T3 gen | S3Gen gen | `gen_RTF` | Wall  | Real-time mult |
 |-------------------------------|-------:|----------:|----------:|------:|---------------:|
 | CPU Linux (F16, 8 threads)    | 3998 ms | 2905 ms   | 0.70      | 8.17 s | 1.4×          |
-| Vulkan 5090 (F16)             |  410 ms |  278 ms   | 0.065     | —       | 15.4×         |
-| Vulkan 5090 (Q4_0)            |  356 ms |  276 ms   | 0.059     | 1.78 s | 17.0×         |
-| Metal M3 Ultra (F16)          |  983 ms |  564 ms   | 0.157     | 2.15 s | 6.4×          |
-| Metal M3 Ultra (Q4_0)         |  965 ms |  608 ms   | 0.144     | 2.06 s | 6.9×          |
+| Vulkan 5090 (F16)             |  402 ms |  282 ms   | 0.064     | —       | 15.6×         |
+| Vulkan 5090 (Q4_0)            |  347 ms |  284 ms   | 0.058     | —       | 17.1×         |
+| Metal M3 Ultra (F16)          |  909 ms |  562 ms   | 0.149     | 2.08 s | 6.7×          |
+| Metal M3 Ultra (Q4_0)         |  886 ms |  608 ms   | 0.137     | 1.98 s | 7.3×          |
 | ONNX q4 addon (CPU, Linux)    |     — (not exposed) |     — | 1.06      | 13.91 s | 0.94×        |
 
 The ONNX addon is shown as a baseline because it's what
