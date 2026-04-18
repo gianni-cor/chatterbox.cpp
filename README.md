@@ -141,29 +141,35 @@ Advanced modes:
   `--output tokens.txt`. Useful for piping into other tools.
 - **S3Gen + HiFT only** — pass `--s3gen-gguf` + `--tokens-file FILE` with
   already-generated speech tokens and no `--model`.
-- **Custom voice (voice cloning)** — first turn a reference `.wav` into
-  a voice profile directory, then pass it as `--ref-dir`:
+- **Custom voice (voice cloning)** — point `--reference-audio` at a
+  reference `.wav` and the C++ binary does everything else natively
+  (no Python, no preprocessing step):
 
   ```bash
-  python scripts/prepare-voice.py --ref-audio me.wav --out voices/me/
   ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
-                     --ref-dir voices/me/ \
                      --reference-audio me.wav \
                      --text "Hello in my voice." \
                      --out out.wav
   ```
 
-  `voices/me/` holds five `.npy` tensors (speaker embedding + prompt
-  tokens + prompt mel for T3 and S3Gen respectively). Reference audio
-  needs to be at least 5 s of clean speech; longer helps.
+  Reference audio needs to be at least 5 s of clean mono speech
+  (16- or 24-kHz WAV — any sample rate works; the binary resamples).
+  Longer helps.  All five voice-conditioning tensors are produced in
+  C++:
 
-  `--reference-audio me.wav` is optional: when set, the C++ binary
-  computes `prompt_feat` natively (WAV load + Kaiser-windowed sinc
-  resample to 24 kHz + 80-channel log-mel) and ignores
-  `voices/me/prompt_feat.npy`. The other four voice tensors still come
-  from the Python helper for now; native `VoiceEncoder` / `CAMPPlus` /
-  `S3TokenizerV2` are on the backlog (`PROGRESS.md` A1 phases 2c-2e).
+  | tensor                         | source                           |
+  |--------------------------------|----------------------------------|
+  | `speaker_emb`                  | C++ VoiceEncoder  (T3 GGUF)      |
+  | `cond_prompt_speech_tokens`    | C++ S3TokenizerV2 (S3Gen GGUF)   |
+  | `prompt_token`                 | C++ S3TokenizerV2 (S3Gen GGUF)   |
+  | `embedding`                    | C++ CAMPPlus      (S3Gen GGUF)   |
+  | `prompt_feat`                  | C++ mel extraction               |
+
+  You can still pre-bake tensors into a voice directory and pass
+  `--ref-dir voices/me/` (any `.npy` there overrides the C++ path for
+  that tensor).  But it's optional now — `--reference-audio` alone is
+  enough.
 
 Play the result:
 
