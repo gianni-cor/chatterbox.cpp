@@ -14,7 +14,8 @@ add_executable(chatterbox
     src/main.cpp
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
-    src/voice_features.cpp)
+    src/voice_features.cpp
+    src/voice_encoder.cpp)
 target_link_libraries(chatterbox PRIVATE ggml)
 target_include_directories(chatterbox PRIVATE ggml/include src)
 
@@ -40,6 +41,13 @@ add_executable(test-resample
     src/voice_features.cpp)
 target_link_libraries(test-resample PRIVATE ggml)
 target_include_directories(test-resample PRIVATE src)
+
+add_executable(test-voice-encoder
+    src/test_voice_encoder.cpp
+    src/voice_encoder.cpp
+    src/voice_features.cpp)
+target_link_libraries(test-voice-encoder PRIVATE ggml)
+target_include_directories(test-voice-encoder PRIVATE ggml/include src)
 
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)

@@ -263,6 +263,52 @@ def main() -> None:
     writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(builtin_speaker, dtype=torch.float32))
     writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
 
+    # VoiceEncoder weights (3-layer unidirectional LSTM + Linear projection).
+    # Used by main.cpp to compute speaker_emb natively when --reference-audio
+    # is given, replacing one of the four tensors that prepare-voice.py still
+    # has to produce. LSTM layout is PyTorch's default: each weight_i{h,h}_l*
+    # is (4*hidden, ...) with the [i, f, g, o] gate rows stacked.
+    ve_path = ckpt_dir / "ve.safetensors"
+    if ve_path.exists():
+        ve_state = load_file(ve_path)
+        VE_HIDDEN = 256
+        VE_INPUT  = 40
+        writer.add_uint32("voice_encoder.n_mels",        VE_INPUT)
+        writer.add_uint32("voice_encoder.hidden_size",   VE_HIDDEN)
+        writer.add_uint32("voice_encoder.num_layers",    3)
+        writer.add_uint32("voice_encoder.embedding_size", VE_HIDDEN)  # proj is (256, 256)
+        writer.add_uint32("voice_encoder.partial_frames", 160)
+        writer.add_uint32("voice_encoder.sample_rate",   16000)
+        writer.add_uint32("voice_encoder.n_fft",         400)
+        writer.add_uint32("voice_encoder.hop_size",      160)
+        writer.add_uint32("voice_encoder.win_size",      400)
+        writer.add_float32("voice_encoder.overlap",      0.5)
+        writer.add_float32("voice_encoder.rate",         1.3)
+        writer.add_float32("voice_encoder.min_coverage", 0.8)
+
+        for k, t in ve_state.items():
+            # Skip the cosine-similarity scaling parameters; they're only used
+            # for training/CFG and don't affect embedding extraction.
+            if k.startswith("similarity_"):
+                continue
+            writer.add_tensor(
+                f"voice_encoder/{k.replace('.', '/')}",
+                as_numpy(t, dtype=torch.float32),
+            )
+
+        # Precomputed mel filterbank for the VE mel (40 channels @ 16 kHz,
+        # n_fft=400). Matches librosa.filters.mel with fmin=0, fmax=8000.
+        import librosa
+        import numpy as np
+        ve_mel_fb = librosa.filters.mel(
+            sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000,
+        ).astype(np.float32)  # (40, 201)
+        writer.add_tensor("voice_encoder/mel_fb",
+                          np.ascontiguousarray(ve_mel_fb))
+        print(f"Embedded VoiceEncoder: 14 tensors, mel_fb {ve_mel_fb.shape}")
+    else:
+        print(f"warning: no ve.safetensors at {ve_path}, skipping VoiceEncoder weights")
+
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()

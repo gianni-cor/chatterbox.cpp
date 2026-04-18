@@ -482,7 +482,7 @@ Ranked by impact-per-effort ratio, from biggest wins to niche polish.
 
 ### Tier A — biggest wins, should be tackled next
 
-#### A1. Voice cloning — **phase 1 DONE**, phases 2-4 pending
+#### A1. Voice cloning — **phases 1, 2a, 2b, 2c DONE**, phases 2d-2e pending
 
 Voice cloning works end-to-end TODAY using a Python preprocessing
 helper that produces a five-tensor voice profile from a reference
@@ -588,13 +588,64 @@ Verified end-to-end: `voice: prompt_feat shape=(520, 80)` /
 `prompt_feat: using C++ override (520 mel frames)` / audible cloned
 voice at RTF 0.76 on 10-core EPYC.
 
-**Phase 2c (NEXT)** — C++ VoiceEncoder (3-layer unidirectional LSTM,
-40-channel 16 kHz mel in, 256-d speaker embedding out). LSTM cell +
-recurrence in ggml follows the `whisper.cpp` / `bark.cpp` patterns.
-The partial-window averaging from `VoiceEncoder.inference` is CPU-side
-bookkeeping.
+**Phase 2c (DONE)** — C++ VoiceEncoder: 3-layer unidirectional LSTM +
+Linear(256 → 256) + ReLU + L2-normalise, 40-channel 16 kHz power-mel in,
+256-d speaker embedding out.
 
-**Phase 2d** — C++ CAMPPlus (TDNN + stats pooling speaker encoder,
+New files:
+- `src/voice_encoder.{h,cpp}` — weights loader (reads 14 tensors from
+  the t3 GGUF + `voice_encoder/mel_fb`), plain-C++ LSTM forward pass
+  (no ggml graph), partial-window averaging that exactly reproduces
+  `VoiceEncoder.embeds_from_wavs(..., as_spk=False)` for a single wav:
+  mel is split into overlapping 160-frame partials using
+  `get_frame_step`/`get_num_wins`, each partial produces an L2-normed
+  256-d embedding via LSTM + projection, then the per-partial embeds
+  are averaged and L2-normed once more.
+- `src/test_voice_encoder.cpp` — parity harness; compares the C++
+  256-d `speaker_emb` against Python `speaker_emb.npy` using
+  `max_abs`, `rms`, `rel` and cosine similarity.
+
+Converter change: `scripts/convert-t3-turbo-to-gguf.py` now bakes in
+the VE weights (`weight_ih_l{0,1,2}`, `weight_hh_l{0,1,2}`,
+`bias_{i,h}h_l{0,1,2}`, `proj/weight`, `proj/bias`) plus the librosa
+(40, 201) mel filterbank as `voice_encoder/mel_fb`, and writes VE
+hyperparameters (n_mels, hidden_size, num_layers, partial_frames,
+sample_rate, n_fft, hop_size, win_size, overlap, rate, min_coverage)
+as GGUF metadata so we never need `ve.safetensors` at runtime.  The
+`similarity_{weight,bias}` params are skipped — they're only used for
+speaker-verification training, not embedding extraction.
+
+Feature extraction: `src/voice_features.cpp` gained
+`mel_extract_16k_40`, which shares the STFT/mel core with
+`mel_extract_24k_80` but uses the VE-specific knobs (`center=True`,
+`power_exponent=2`, no log compression).
+
+CLI wiring: `main.cpp` now resolves the T3 voice override in two
+independent pieces.  If `ref_dir/speaker_emb.npy` is missing but
+`--reference-audio PATH.wav` is given AND the T3 GGUF has VE weights,
+it loads the wav, resamples to 16 kHz, and computes `speaker_emb` in
+C++ via `voice_encoder_embed()`.  `cond_prompt_speech_tokens` still
+comes from `ref_dir` until Phase 2e. Logs distinguish the source:
+`T3 voice override — speaker_emb=C++ VoiceEncoder, cond_prompt_tokens=ref_dir`.
+
+Verification on 10.4 s reference wav:
+
+```
+[result] C++ vs Python speaker_emb:
+    n=256  max_abs=1.71e-05  rms=2.58e-06  max|ref|=2.45e-01  rel=6.97e-05
+    cosine similarity = 1.000000
+```
+
+Cosine = 1.000000 confirms angular match to 6 decimal places; the
+~1e-5 absolute error is pure float32 accumulation noise.  End-to-end
+synthesis with `speaker_emb.npy` *deleted* from the voice dir produced
+a 276 kB WAV that plays cleanly on macOS — the C++-computed speaker
+embedding drives T3 conditioning indistinguishably from Python.
+
+Two down, two to go (`embedding` and `prompt_token` via CAMPPlus +
+S3TokenizerV2).
+
+**Phase 2d (NEXT)** — C++ CAMPPlus (TDNN + stats pooling speaker encoder,
 80-ch Fbank at 16 kHz → 192-d `embedding`). ~400-line Python, mostly
 dilated 1-D conv stacks; mean/std pooling is trivial to implement.
 

@@ -143,41 +143,45 @@ static void reflect_pad_1d(const std::vector<float> & in, int p_left, int p_righ
     }
 }
 
-std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
-                                      const std::vector<float> & mel_filterbank)
+// Shared mel-spectrogram core. Handles:
+//   - center mode: 0 = center=False (reflect-pad by (n_fft-hop)/2), 1 = center=True
+//                  (reflect-pad by n_fft/2 each side, produces 1 + L/hop frames).
+//   - power_exponent: 1.0 = magnitude, 2.0 = power spectrogram.
+//   - log_floor > 0 means log-compress with clamp(x, log_floor); <= 0 means no log.
+static std::vector<float> mel_extract_generic(
+    const std::vector<float> & wav,
+    const std::vector<float> & mel_filterbank,
+    int n_fft, int hop, int win, int n_mels,
+    int center_mode,        // 0 = center=False, 1 = center=True
+    float power_exponent,   // 1.0 or 2.0
+    float log_floor,        // > 0 → log-compress with clamp; <= 0 → no log
+    bool transpose_to_T_M)  // true: return (T, M); false: return (M, T)
 {
-    const int n_fft  = 1920;
-    const int hop    = 480;
-    const int win    = 1920;   // == n_fft in the s3gen config
-    const int n_mels = 80;
-    const int F      = n_fft / 2 + 1;   // 961
-
+    const int F = n_fft / 2 + 1;
     if (mel_filterbank.size() != (size_t)(n_mels * F)) {
         fprintf(stderr,
-            "mel_extract_24k_80: filterbank has %zu elements, expected %d (n_mels * F)\n",
+            "mel_extract_generic: filterbank has %zu elements, expected %d (n_mels * F)\n",
             mel_filterbank.size(), n_mels * F);
         return {};
     }
 
-    // reflect-pad by (n_fft - hop) / 2 = 720 each side (center=False analogue).
-    const int pad = (n_fft - hop) / 2;
+    // Reflect-pad.  center=False → (n_fft - hop)/2 each side.
+    // center=True  → n_fft/2 each side (librosa default, matches
+    // voice_encoder.melspec._stft / torch.stft center=True).
+    const int pad = (center_mode == 0) ? (n_fft - hop) / 2 : n_fft / 2;
     std::vector<float> padded;
-    reflect_pad_1d(wav_24k, pad, pad, padded);
+    reflect_pad_1d(wav, pad, pad, padded);
     const int L = (int)padded.size();
 
-    // Number of frames such that each frame fits inside padded:
-    //   frame t starts at t*hop, ends at t*hop + win.
-    // center=False means t*hop + win <= L  →  t <= (L - win) / hop.
     if (L < win) return {};
-    const int T = (L - win) / hop + 1;
+    const int T = (center_mode == 0)
+        ? (L - win) / hop + 1                      // (L - win) / hop + 1
+        : 1 + (int)wav.size() / hop;               // librosa invariant
 
-    // Hann window (periodic), pre-computed once.
     std::vector<float> hann(win);
-    for (int n = 0; n < win; ++n) {
+    for (int n = 0; n < win; ++n)
         hann[n] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * (float)n / (float)win));
-    }
 
-    // DFT twiddle tables (real & imag per bin, per time index in [0, n_fft)).
     std::vector<float> cos_tbl((size_t)F * n_fft);
     std::vector<float> sin_tbl((size_t)F * n_fft);
     for (int k = 0; k < F; ++k) {
@@ -188,15 +192,11 @@ std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
         }
     }
 
-    // magnitude[F, T], row-major by F then T.
-    std::vector<float> magnitude((size_t)F * T);
+    std::vector<float> spec((size_t)F * T);
     std::vector<float> frame(win);
     for (int t = 0; t < T; ++t) {
-        // window * x[t*hop : t*hop + win]
         const float * x = padded.data() + t * hop;
         for (int n = 0; n < win; ++n) frame[n] = x[n] * hann[n];
-
-        // DFT bins (real input, one-sided).
         for (int k = 0; k < F; ++k) {
             const float * cs = cos_tbl.data() + (size_t)k * n_fft;
             const float * sn = sin_tbl.data() + (size_t)k * n_fft;
@@ -205,28 +205,53 @@ std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
                 re += frame[n] * cs[n];
                 im -= frame[n] * sn[n];  // torch stft uses exp(-j...)
             }
-            magnitude[(size_t)k * T + t] = std::sqrt(re * re + im * im + 1e-9f);
+            float mag = std::sqrt(re * re + im * im + 1e-9f);
+            if (power_exponent == 2.0f) mag = mag * mag;
+            else if (power_exponent != 1.0f) mag = std::pow(mag, power_exponent);
+            spec[(size_t)k * T + t] = mag;
         }
     }
 
-    // mel[M, T] = filterbank[M, F] @ magnitude[F, T].
     std::vector<float> mel((size_t)n_mels * T);
     for (int m = 0; m < n_mels; ++m) {
         const float * fb_row = mel_filterbank.data() + (size_t)m * F;
         for (int t = 0; t < T; ++t) {
             float acc = 0.0f;
-            for (int k = 0; k < F; ++k) acc += fb_row[k] * magnitude[(size_t)k * T + t];
+            for (int k = 0; k < F; ++k) acc += fb_row[k] * spec[(size_t)k * T + t];
             mel[(size_t)m * T + t] = acc;
         }
     }
 
-    // log-compress with 1e-5 floor (matches spectral_normalize_torch).
-    for (float & v : mel) v = std::log(std::max(v, 1e-5f));
+    if (log_floor > 0.0f)
+        for (float & v : mel) v = std::log(std::max(v, log_floor));
 
-    // Transpose to (T, n_mels) — that's the layout S3Gen expects for prompt_feat.
+    if (!transpose_to_T_M) return mel;
+
     std::vector<float> out((size_t)T * n_mels);
     for (int m = 0; m < n_mels; ++m)
         for (int t = 0; t < T; ++t)
             out[(size_t)t * n_mels + m] = mel[(size_t)m * T + t];
     return out;
+}
+
+std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
+                                      const std::vector<float> & mel_filterbank)
+{
+    // center=False, magnitude (power_exp=1), log-compress with 1e-5 floor,
+    // transpose to (T, 80).
+    return mel_extract_generic(wav_24k, mel_filterbank,
+        /*n_fft=*/1920, /*hop=*/480, /*win=*/1920, /*n_mels=*/80,
+        /*center=*/0, /*power_exp=*/1.0f, /*log_floor=*/1e-5f,
+        /*transpose=*/true);
+}
+
+std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
+                                      const std::vector<float> & mel_filterbank)
+{
+    // center=True (librosa stft default), POWER spectrogram (mel_power=2.0),
+    // NO log (mel_type='amp', normalized_mels=False), transpose to (T, 40).
+    return mel_extract_generic(wav_16k, mel_filterbank,
+        /*n_fft=*/400, /*hop=*/160, /*win=*/400, /*n_mels=*/40,
+        /*center=*/1, /*power_exp=*/2.0f, /*log_floor=*/-1.0f,
+        /*transpose=*/true);
 }

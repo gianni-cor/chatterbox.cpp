@@ -58,3 +58,20 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
 // Returns a row-major (T_mel, 80) tensor, where T_mel = (L_wav + 2*720 - 1920) / 480 + 1.
 std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
                                       const std::vector<float> & mel_filterbank);
+
+// Compute the 40-channel mel *power* spectrogram at 16 kHz that VoiceEncoder
+// consumes, matching voice_encoder.melspec.melspectrogram with its default
+// hyperparameters:
+//
+//   n_fft=400  hop=160  win=400  center=True (reflect-pad n_fft/2 each side)
+//   mel_power = 2 (POWER, not magnitude)
+//   mel_type = "amp" (no log / db conversion)
+//   normalized_mels = False
+//
+// `mel_filterbank` must be the librosa (40, 201)=8040-element filterbank
+// produced with those parameters; convert-t3-turbo-to-gguf.py bakes it in as
+// `voice_encoder/mel_fb`.
+//
+// Returns a row-major (T_mel, 40) tensor, where T_mel = 1 + L_wav / hop.
+std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
+                                      const std::vector<float> & mel_filterbank);
