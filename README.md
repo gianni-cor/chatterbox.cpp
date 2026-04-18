@@ -60,18 +60,28 @@ cd chatterbox.cpp
 # ggml is vendored as a sibling subdirectory
 git clone https://github.com/ggml-org/ggml.git ggml
 
-# Build all 3 binaries: chatterbox, mel2wav, test-s3gen
+# Configure + build every target in one shot.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
 
-This produces:
+This produces the main binary plus a set of per-stage validation harnesses:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/chatterbox` | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT) |
-| `build/mel2wav` | HiFT only: mel.npy → wav (demo) |
-| `build/test-s3gen` | Staged numerical validation vs Python dumps |
+| `build/chatterbox`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Also handles voice cloning via `--reference-audio`. |
+| `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
+| `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
+| `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler |
+| `build/test-voice-features`   | 24 kHz 80-ch mel parity (prompt_feat) |
+| `build/test-fbank`            | 16 kHz 80-ch Kaldi fbank parity |
+| `build/test-voice-encoder`    | VoiceEncoder 256-d speaker embedding parity |
+| `build/test-campplus`         | CAMPPlus 192-d embedding parity |
+| `build/test-voice-embedding`  | wav → fbank → CAMPPlus end-to-end parity |
+| `build/test-s3tokenizer`      | S3TokenizerV2 log-mel + speech-token parity |
+
+You'll normally only need `build/chatterbox`; the `test-*` binaries are
+there for the staged-verification methodology in `PROGRESS.md`.
 
 ## 2. One-time: convert weights
 
@@ -97,8 +107,12 @@ You should now have:
 
 ```
 models/
-  chatterbox-t3-turbo.gguf   (~730 MB, F16 T3 weights + embedded GPT-2 BPE tokenizer)
-  chatterbox-s3gen.gguf      (~410 MB, F32 S3Gen + HiFT weights + built-in voice)
+  chatterbox-t3-turbo.gguf   (~742 MB) — T3 GPT-2 Medium + embedded GPT-2 BPE
+                               tokenizer + VoiceEncoder weights + built-in voice
+  chatterbox-s3gen.gguf      (~1.0 GB) — S3Gen encoder/CFM + HiFT vocoder
+                               + CAMPPlus speaker encoder + S3TokenizerV2
+                               (everything needed for voice cloning, on top of
+                               the built-in reference voice)
 ```
 
 For numerical validation against PyTorch (optional, step 4), also run:
