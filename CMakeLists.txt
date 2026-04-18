@@ -16,7 +16,8 @@ add_executable(chatterbox
     src/chatterbox_tts.cpp
     src/voice_features.cpp
     src/voice_encoder.cpp
-    src/campplus.cpp)
+    src/campplus.cpp
+    src/s3tokenizer.cpp)
 target_link_libraries(chatterbox PRIVATE ggml)
 target_include_directories(chatterbox PRIVATE ggml/include src)
 find_package(OpenMP)
@@ -82,6 +83,13 @@ target_include_directories(test-voice-embedding PRIVATE ggml/include src)
 if (OpenMP_CXX_FOUND)
     target_link_libraries(test-voice-embedding PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+# S3TokenizerV2 (speech-to-token encoder) validation harness.
+add_executable(test-s3tokenizer
+    src/test_s3tokenizer.cpp
+    src/s3tokenizer.cpp)
+target_link_libraries(test-s3tokenizer PRIVATE ggml)
+target_include_directories(test-s3tokenizer PRIVATE ggml/include src)
 
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)

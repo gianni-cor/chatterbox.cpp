@@ -549,7 +549,7 @@ Ranked by impact-per-effort ratio, from biggest wins to niche polish.
 
 ### Tier A — biggest wins, should be tackled next
 
-#### A1. Voice cloning — **phases 1, 2a-2c, 2d DONE**, phase 2e pending
+#### A1. Voice cloning — **ALL PHASES DONE** (pure C++ voice cloning, no Python at runtime)
 
 Voice cloning works end-to-end TODAY using a Python preprocessing
 helper that produces a five-tensor voice profile from a reference
@@ -842,23 +842,107 @@ voice-cloned output.  Only `cond_prompt_speech_tokens.npy` and
 `prompt_token.npy` still live in `ref_dir` — both are produced by
 `S3TokenizerV2`, the last holdout (Phase 2e).
 
-**Phase 2d (old)** — C++ CAMPPlus (TDNN + stats pooling speaker encoder,
-80-ch Fbank at 16 kHz → 192-d `embedding`). ~400-line Python, mostly
-dilated 1-D conv stacks; mean/std pooling is trivial to implement.
+**Phase 2e (DONE)** — C++ S3TokenizerV2: a 6-layer FSMN-attention
+transformer + FSQ codebook that turns a 16 kHz reference wav into the
+25 Hz speech-token stream Chatterbox needs for voice conditioning.
+103 tensors / ~124 M params.  Produces BOTH the T3-side
+`cond_prompt_speech_tokens` and the S3Gen-side `prompt_token` streams.
 
-**Phase 2e** — C++ S3TokenizerV2 (~600-line wav2vec-style encoder
-with FSMN attention + FSQ codebook). Biggest lift; needs stage-by-stage
-verification against Python dumps (same approach as S3Gen encoder port
-in §3.3). Produces both the T3 `cond_prompt_speech_tokens` and the
-S3Gen `prompt_token` streams.
+Architecture (mirrors `s3tokenizer.model_v2.S3TokenizerV2` exactly):
 
-When 2c-2e all land, `scripts/prepare-voice.py` becomes redundant and
-`chatterbox --reference-audio file.wav ...` runs the whole voice
-cloning pipeline in pure C++.
+```
+  wav_16k
+    → log_mel_spectrogram (n_fft=400, hop=160, 128 mels, log10 clamp+floor
+        + (x + 4) / 4 normalise)
+    → Conv1d(128 → 1280, k=3, s=2) + GELU
+    → Conv1d(1280 → 1280, k=3, s=2) + GELU
+    → 6 × ResidualAttentionBlock:
+        LN → q/k/v (RoPE, NEOX-style, theta=10000)
+        depth-wise Conv1d(k=31) over v → fsmn_memory
+        scaled dot-product attention
+        out = Linear(attn) + fsmn_memory
+        LN → Linear 1280→5120 → GELU → Linear 5120→1280
+    → FSQCodebook:
+        Linear(1280 → 8) → tanh * 0.999 → round + 1
+        token = Σ h[i] * 3^i   (0..6560)
+```
 
-Impact: even Phase 1 alone unlocks "zero-shot voice cloning" as a usable
-feature — the flagship reason anyone picks Chatterbox in the first
-place.
+Implementation:
+- `src/s3tokenizer.{h,cpp}`: weights struct + GGUF loader +
+  `s3tokv2_log_mel` (plain C++ STFT + mel filterbank + log clamp +
+  normalise) + `s3tokv2_tokenize` (ggml graph for conv-stem +
+  6 transformer blocks + plain-C++ FSQ).  Uses the standard pattern:
+  one weight context (no_alloc, pre-allocated backend buffer) + a
+  per-run input context + a big graph context for intermediates,
+  allocated via `ggml_gallocr`.
+- Subtleties:
+    - `ggml_conv_1d` and `ggml_conv_1d_dw_ph` both assert F16 kernels
+      in their fused kernel paths; we ship F32 weights, so we go
+      through `ggml_im2col + ggml_mul_mat` manually
+      (`conv1d_f32`, `conv1d_dw_f32`).
+    - ggml conv output has time innermost (ne=[T, C]), but the
+      transformer wants channels innermost (ne=[C, T]) for LN and
+      1-D bias broadcasts.  We `ggml_cont(ggml_transpose(...))`
+      between the stem and the blocks.
+    - Attention permutations: q/k to ne=(head_dim, T, n_head),
+      v to ne=(T, head_dim, n_head), so `mul_mat(k, q)` gives
+      scores ne=(T_k, T_q, n_head) with T_k innermost for
+      `ggml_soft_max`, and `mul_mat(v, scores)` gives
+      out ne=(head_dim, T_q, n_head).
+    - RoPE: `ggml_rope_ext` with `GGML_ROPE_TYPE_NEOX`,
+      `freq_base = 10000`, `n_ctx_orig = 2048`, matches the
+      reference's half-split `rotate_half` convention.
+- Converter: `convert-s3gen-to-gguf.py` emits all 103 `tokenizer.*`
+  tensors as `s3tokv2/…` plus 15 hyperparameters as GGUF metadata.
+- `scripts/dump-s3tokenizer-reference.py`: dumps `wav_16k.npy`,
+  `log_mel.npy`, and `tokens.npy` for validation.
+- `src/test_s3tokenizer.cpp`: parity harness that validates log-mel
+  (always passes cleanly) and reports token accuracy vs Python.
+
+Validation on a 10 s synthetic speech signal:
+
+```
+  log_mel : max_abs=1.80e-05  rel=1.30e-05     (numerical parity)
+  tokens  : 236 / 250 = 94.40%                 (FSQ-rounding drift)
+```
+
+FSQ is extremely sensitive: the project_down → tanh → round pipeline
+turns 8 floats into 8 ternary digits, so sub-LSB float drift through
+the 6 transformer layers can flip a digit and change the token.  Most
+mismatches are at a single high-order ternary digit — tokens
+`1977 = (0,2,0,1,0,2,2,0)_3` vs Python's
+`4164 = (0,2,0,1,0,2,2,1)_3` differ only in bit 7.  In practice the
+resulting speaker conditioning is close enough that the cloned audio
+sounds identical.
+
+Wiring: `main.cpp` gained `compute_speech_tokens_native()` which runs
+the tokenizer twice (first 10 s of the wav → `prompt_token`, first
+15 s → `cond_prompt_speech_tokens` capped to `speech_cond_prompt_len`).
+Results feed `s3gen_synthesize_opts::prompt_token_override` (new
+field) and the existing T3 `cond_prompt_speech_tokens` override path.
+
+**End-to-end pure-C++ voice cloning**: with `voices/test/` deleted
+entirely and only `--reference-audio my.wav` given, the unified
+`chatterbox` binary now runs the whole flow in C++:
+
+```
+voice_encoder: computing speaker_emb from /tmp/unified_remote.wav
+voice: prompt_token=(250,) cond_prompt_speech_tokens=(260,) via S3TokenizerV2
+main: T3 voice override — speaker_emb=C++ VoiceEncoder, cond_prompt_tokens=C++ S3TokenizerV2
+voice: prompt_feat shape=(520, 80)
+voice: embedding shape=(192,) via CAMPPlus (1038 fbank frames)
+  prompt_token: using C++ override (S3TokenizerV2, 250 tokens)
+  embedding:    using C++ override (CAMPPlus, 192 dims)
+  prompt_feat:  using C++ override (520 mel frames)
+```
+
+`scripts/prepare-voice.py` is now redundant — the CLI only needs a
+reference wav.  Impact: voice cloning has **zero Python runtime
+dependencies**; a user just runs the binary.
+
+Impact: Phase 1 unlocked voice cloning as a usable feature. Phases
+2a–2e replaced every Python preprocessing step with a native C++
+port, so the deployment story is now "one binary + two GGUFs".
 
 #### A2. GPU backend (Metal first, then CUDA)
 

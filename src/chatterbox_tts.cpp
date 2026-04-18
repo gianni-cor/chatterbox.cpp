@@ -1148,16 +1148,21 @@ int s3gen_synthesize_to_wav(
     std::vector<float>   pf_data;
     int pf_rows = 0;  // mel_len1
 
-    if (ref_dir.empty() && opts.embedding_override.empty() && opts.prompt_feat_override.empty()) {
+    if (ref_dir.empty() && opts.embedding_override.empty() && opts.prompt_feat_override.empty()
+        && opts.prompt_token_override.empty()) {
         fprintf(stderr, "No --ref-dir given; loading built-in voice from GGUF.\n");
     } else {
         if (!ref_dir.empty()) fprintf(stderr, "Loading ref dict from %s\n", ref_dir.c_str());
 
-        // prompt_token has to come from ref_dir for now (Phase 2e will port
-        // S3TokenizerV2 to produce it natively).
-        npy_array pt_npy = npy_load(ref_dir + "/prompt_token.npy");
-        pt_data.assign((const int32_t*)pt_npy.data.data(),
-                       (const int32_t*)pt_npy.data.data() + pt_npy.n_elements());
+        if (!opts.prompt_token_override.empty()) {
+            pt_data = opts.prompt_token_override;
+            fprintf(stderr, "  prompt_token: using C++ override (S3TokenizerV2, %zu tokens)\n",
+                    pt_data.size());
+        } else {
+            npy_array pt_npy = npy_load(ref_dir + "/prompt_token.npy");
+            pt_data.assign((const int32_t*)pt_npy.data.data(),
+                           (const int32_t*)pt_npy.data.data() + pt_npy.n_elements());
+        }
 
         if (!opts.embedding_override.empty()) {
             emb_data = opts.embedding_override;

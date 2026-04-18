@@ -359,6 +359,49 @@ def main():
         print(f"Embedded CAMPPlus: {n_conv} conv/linear tensors + {n_bn} fused BNs "
               f"+ kaldi mel filterbank {kaldi_fb.shape}")
 
+    # -------------------------------------------------------------------------
+    # S3TokenizerV2 (FunASR speech-to-token encoder that produces the 25 Hz
+    # token stream Chatterbox uses for voice conditioning).  103 raw tensors:
+    #   tokenizer._mel_filters                   (128, 201) librosa mel fb
+    #   tokenizer.encoder.conv{1,2}.{weight,bias}
+    #   tokenizer.encoder.blocks.{0..5}.*        (16 tensors each × 6 = 96)
+    #   tokenizer.quantizer._codebook.project_down.{weight,bias}
+    # -------------------------------------------------------------------------
+    tok_keys = [k for k in state if k.startswith("tokenizer.")]
+    if not tok_keys:
+        print("warning: no tokenizer.* tensors found in s3gen.safetensors")
+    else:
+        n_tok = 0
+        for k in tok_keys:
+            rest = k[len("tokenizer."):]
+            # Skip window buffer (we recompute it).
+            if rest in ("window",):
+                continue
+            if rest == "_mel_filters":
+                gguf_name = "s3tokv2/mel_fb"
+            else:
+                gguf_name = "s3tokv2/" + rest.replace(".", "/")
+            writer.add_tensor(gguf_name, as_numpy(state[k], dtype=torch.float32))
+            n_tok += 1
+
+        writer.add_uint32("s3tokv2.n_mels",        128)
+        writer.add_uint32("s3tokv2.n_audio_state", 1280)
+        writer.add_uint32("s3tokv2.n_audio_head",  20)
+        writer.add_uint32("s3tokv2.n_audio_layer", 6)
+        writer.add_uint32("s3tokv2.head_dim",      64)
+        writer.add_uint32("s3tokv2.mlp_ratio",     4)
+        writer.add_uint32("s3tokv2.fsmn_kernel",   31)
+        writer.add_uint32("s3tokv2.fsq_levels",    3)
+        writer.add_uint32("s3tokv2.fsq_dim",       8)
+        writer.add_uint32("s3tokv2.codebook_size", 3 ** 8)
+        writer.add_uint32("s3tokv2.conv_stride",   2)
+        writer.add_uint32("s3tokv2.n_fft",         400)
+        writer.add_uint32("s3tokv2.hop",           160)
+        writer.add_uint32("s3tokv2.sample_rate",   16000)
+        writer.add_float32("s3tokv2.rope_theta",   10000.0)
+        writer.add_uint32("s3tokv2.rope_max_pos",  2048)
+        print(f"Embedded S3TokenizerV2: {n_tok} tensors")
+
     n_flow = sum(1 for k in state if k.startswith("flow.")) - sum(1 for k in state if k.startswith("flow.decoder.estimator."))
     n_cfm  = len(decoder_keys)
     n_hift = len(mel2wav_keys)

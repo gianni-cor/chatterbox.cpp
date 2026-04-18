@@ -34,6 +34,11 @@ struct s3gen_synthesize_opts {
     // when --reference-audio is given.
     std::vector<float> embedding_override;
 
+    // Optional: if non-empty, override the S3Gen-side reference speech
+    // tokens (`prompt_token`).  Populated from --reference-audio via
+    // S3TokenizerV2 in main.cpp (Phase 2e).
+    std::vector<int32_t> prompt_token_override;
+
     int  seed      = 42;
     int  n_threads = 0;          // 0 = hardware_concurrency
     int  sr        = 24000;
