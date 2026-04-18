@@ -24,6 +24,19 @@ add_executable(mel2wav src/mel2wav.cpp)
 target_link_libraries(mel2wav PRIVATE ggml)
 target_include_directories(mel2wav PRIVATE ggml/include src)
 
+# Voice-cloning preprocessing validation (WAV I/O + resample + 80-ch mel).
+add_executable(test-voice-features
+    src/test_voice_features.cpp
+    src/voice_features.cpp)
+target_link_libraries(test-voice-features PRIVATE ggml)
+target_include_directories(test-voice-features PRIVATE ggml/include src)
+
+add_executable(test-resample
+    src/test_resample.cpp
+    src/voice_features.cpp)
+target_link_libraries(test-resample PRIVATE ggml)
+target_include_directories(test-resample PRIVATE src)
+
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)
 endif()

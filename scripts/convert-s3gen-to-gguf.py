@@ -226,6 +226,15 @@ def main():
         gguf_name = k.replace("mel2wav.", "hift/").replace(".", "/")
         writer.add_tensor(gguf_name, as_numpy(state[k], dtype=torch.float32))
 
+    # Bake in the pre-computed 80-channel mel filterbank used by
+    # s3gen.utils.mel.mel_spectrogram so the C++ side can compute prompt_feat
+    # natively for voice cloning (see src/voice_features.cpp).
+    import librosa
+    mel_fb_24k_80 = librosa.filters.mel(
+        sr=24000, n_fft=1920, n_mels=80, fmin=0, fmax=8000,
+    ).astype(np.float32)  # (80, 961)
+    writer.add_tensor("s3gen/mel_fb/24k_80", np.ascontiguousarray(mel_fb_24k_80))
+
     n_flow = sum(1 for k in state if k.startswith("flow.")) - sum(1 for k in state if k.startswith("flow.decoder.estimator."))
     n_cfm  = len(decoder_keys)
     n_hift = len(mel2wav_keys)
