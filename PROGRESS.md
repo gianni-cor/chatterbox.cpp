@@ -44,7 +44,7 @@ Plus `scripts/synthesize.sh` which composes the two into a single command.
 |-----------------------------|----------:|------:|--------------:|
 | CPU (10-core EPYC, F16)     | 0.70      | 8.2 s | 3.6× faster   |
 | **Vulkan (RTX 5090, Q4_0)** | **0.06**  | **1.8 s** | **7.8×** |
-| **Metal (M3 Ultra, Q4_0)**  | **0.14**  | **2.0 s** | **7.0×** |
+| **Metal (M3 Ultra, Q4_0)**  | **0.13**  | **1.9 s** | **7.4×** |
 | ONNX q4 addon (CPU baseline) | 1.06     | 13.9 s | 1.0×         |
 
 GPU support and Metal kernel fixes are described in §3.11 / §3.12;
@@ -749,6 +749,74 @@ Sampling output is not bit-exact against §3.13 either — same reason as
 before, FA reductions are sensitive to operand stride.  Token counts
 shift within ±1 % at the same seed.
 
+### 3.15  ggml-metal: fuse `mul_mat + add(bias)` for Q-variant matvec
+
+Even after §3.14 the T3 step path still dispatched two Metal kernels
+per linear layer — `mul_mv` for the matmul itself, then `bin_fuse` for
+the following `add(bias)`.  T3 has 4 such linears per layer
+(QKV proj, attn proj, MLP fc, MLP proj) × 24 layers = 96 extra bias
+kernels per step.  At ~9 µs dispatch overhead on M3 Ultra that's
+~900 µs/step / ~240 ms over a 260-token generation.
+
+Patched ggml-metal to fuse these directly inside the mul_mv kernel
+(third addition to `patches/ggml-metal-chatterbox-ops.patch`):
+
+1. New function constant `FC_mul_mv_has_bias` at `FC_MUL_MV + 2`.
+2. Each Q-variant top-level kernel (`kernel_mul_mv_q4_0_f32`,
+   `_q4_1_f32`, `_q5_0_f32`, `_q5_1_f32`, `_q8_0_f32`) picks up an
+   extra `device const char * bias` buffer argument and calls a tiny
+   `helper_mv_add_bias<NR0>` immediately after the existing impl.
+   The post-pass only runs when the function constant is true and
+   only one thread per row does the add (no cross-threadgroup
+   synchronisation needed; each threadgroup writes and then reads
+   back only its own output rows).
+3. `ggml_metal_op_mul_mat` gets a `ctx->use_fusion &&
+   kernel_supports_bias` look-ahead: if the next op is an `ADD` with
+   a contiguous F32 `[ne0, 1]` bias, we compile the pipeline with
+   `has_bias=true`, bind the bias buffer to slot 4, redirect the
+   matmul's `dst` to the ADD's output tensor, and return `n_fuse=2`
+   so the dispatcher skips the ADD.  The shared pipeline name
+   (`…_bias=1`) makes the fused variant cache-coherent with the
+   non-fused one.
+4. For kernels not yet wired (F16/BF16 `mul_mv_t_t`, the `_4` SIMD
+   variants, all the K-quants and IQ variants) the fusion is
+   suppressed by `kernel_supports_bias`, the pipeline compiles with
+   `has_bias=false`, and the kernel's `if (FC_mul_mv_has_bias)` is
+   dead-code eliminated.  MoE `mul_mv_id` keeps calling the original
+   impl via `mmv_fn` unchanged; the impl signature itself was not
+   touched.
+
+Measured on M3 Ultra, 10 s sentence, seed 42, 3-run warm average:
+
+| Variant  | T3 before §3.15 | T3 after §3.15 | Δ      | Wall before | Wall after |
+|----------|----------------:|---------------:|-------:|------------:|-----------:|
+| F16      |          909 ms |         915 ms | ~flat  |   2.08 s    |  2.26 s    |
+| Q8_0     |          906 ms |         819 ms | −9.6%  |   2.03 s    |  2.02 s    |
+| Q5_0     |          984 ms |         840 ms | −14.6% |   2.09 s    |  1.96 s    |
+| **Q4_0** |      **886 ms** |     **766 ms** | **−13.5%** | **1.98 s**  | **1.87 s** |
+
+F16 is flat because the kernel it hits (`mul_mv_f16_f32_4`) isn't in
+the supported list yet; extending to those variants is a mechanical
+follow-up (touches `helper_mv_reduce_and_write` + the 3 `_t_t` /
+`_t_t_4` / `_t_t_short` templates in the same way).
+
+Vulkan RTX 5090 unchanged (347 → 343 ms on Q4_0 — noise).  CPU
+unaffected (Metal-only change).
+
+Total Metal Q4_0 journey (pre-FA → end of §3.15):
+
+```
+              T3 infer   Wall    gen_RTF
+pre-FA         1274 ms   2.36 s   0.176
+§3.13 FA+KV     965 ms   2.06 s   0.144     -24%
+§3.14 Q views   886 ms   1.98 s   0.131     -30%
+§3.15 bias fn   766 ms   1.87 s   0.119     -40%
+```
+
+**40 % faster T3 inference, 21 % faster end-to-end wall** than the
+pre-optimization baseline on the same M3 Ultra — all via Metal
+kernel + graph-shape changes, no model changes.
+
 ### Cross-backend summary
 
 Same 10 s sentence, seed 42, `gen_RTF` is inference-only (excludes
@@ -759,8 +827,8 @@ load time):
 | CPU Linux (F16, 8 threads)    | 3998 ms | 2905 ms   | 0.70      | 8.17 s | 1.4×          |
 | Vulkan 5090 (F16)             |  402 ms |  282 ms   | 0.064     | —       | 15.6×         |
 | Vulkan 5090 (Q4_0)            |  347 ms |  284 ms   | 0.058     | —       | 17.1×         |
-| Metal M3 Ultra (F16)          |  909 ms |  562 ms   | 0.149     | 2.08 s | 6.7×          |
-| Metal M3 Ultra (Q4_0)         |  886 ms |  608 ms   | 0.137     | 1.98 s | 7.3×          |
+| Metal M3 Ultra (F16)          |  915 ms |  567 ms   | 0.150     | 2.26 s | 6.7×          |
+| Metal M3 Ultra (Q4_0)         |  766 ms |  596 ms   | 0.128     | 1.87 s | 7.8×          |
 | ONNX q4 addon (CPU, Linux)    |     — (not exposed) |     — | 1.06      | 13.91 s | 0.94×        |
 
 The ONNX addon is shown as a baseline because it's what

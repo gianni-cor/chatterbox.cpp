@@ -39,6 +39,7 @@ on Metal:
 | T3 crashes: `unsupported op 'DIAG_MASK_INF'`  | No op entry / no kernel                            | Adds `kernel_diag_mask_inf_f32`, dispatcher, `supports_op` case|
 | S3Gen crashes: `unsupported op 'PAD'` when any front-pad (`lp0..lp3`) is non-zero | Kernel only supports tail padding; `supports_op` rejects non-zero front pads | Extends `kernel_pad_f32` + `ggml_metal_kargs_pad` to honour `lp0..lp3` and drops the rejection  |
 | HiFT decode is ~100× slower than CPU          | `kernel_conv_transpose_1d` is scalar: 1 thread per output pixel iterating over *all* `IC * IL` inputs, with most of the work inside a conditional | Tighten the input-position range to the few that contribute (`i_min..i_max`) and parallelise `IC` across a 32-thread simdgroup with `simd_sum` reduction |
+| T3 step does 96 extra `bin_fuse` dispatches/step for `add(bias)` after each Q-variant `mul_mv` | `mul_mv` and the following bias add are separate Metal kernels | Fuse `mul_mat + add(bias)` for the Q-variant mat-vec kernels (Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0) via a new `FC_mul_mv_has_bias` function constant and a tiny `helper_mv_add_bias<NR0>` post-pass in each top-level kernel wrapper. The op encoder detects the pattern and returns `n_fuse=2` to consume the ADD |
 
 Measured on M3 Ultra, `hift_decode` at HiFT-realistic shapes:
 - Before: ~15 000 ms
