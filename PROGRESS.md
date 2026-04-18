@@ -421,6 +421,62 @@ end-to-end sampling test to the validation list: run T3 with Python's
 stochastic defaults (fixed seed) and compare the full token stream
 byte-for-byte against C++ with the same seed.
 
+### 3.10  Benchmark: chatterbox.cpp vs ONNX addon on the same machine
+
+Compared end-to-end throughput against the in-house
+`qvac-lib-infer-onnx-tts` addon (ONNX Runtime backend, pre-built q4
+Chatterbox models at 692 MB on disk). Same 10-core EPYC host, same
+prompt ("Hello from native C plus plus. This audio was generated end
+to end on CPU using ggml."), built-in voice on both sides, `--threads 10`
+for ggml, ORT's own default threading for ONNX. Each configuration run
+three times after a disk-cache warm-up; all reported numbers are stable
+across the three runs.
+
+**Model footprint on disk:**
+
+| | Size |
+|---|---:|
+| ONNX q4 (5 files: tokenizer, speech_encoder, embed_tokens, conditional_decoder, language_model) | 692 MB |
+| ggml F16 (T3 + S3Gen) | 1285 MB |
+| ggml Q8_0 (T3 + S3Gen) | 1004 MB |
+| ggml Q5_0 (T3 + S3Gen) | 893  MB |
+| ggml Q4_0 (T3 + S3Gen) | 857  MB |
+
+**End-to-end runtime (load + generate, shorter is better):**
+
+| Pipeline | Load (s) | Generate (s) | Total wall (s) | Audio out (s) | RTF (total) |
+|---|---:|---:|---:|---:|---:|
+| **ONNX q4** (addon)               | 4.30 | 6.87  | **11.17** | 5.88 | 1.90× slower |
+| **ggml F16** (chatterbox.cpp)     |  —   |  —    |  **5.71** | 6.56 | 0.87× slower |
+| **ggml Q8_0** (chatterbox.cpp)    |  —   |  —    |  **4.84** | 6.56 | 0.74× slower |
+| **ggml Q5_0** (chatterbox.cpp)    |  —   |  —    |  **4.67** | 6.64 | 0.70× slower |
+| **ggml Q4_0** (chatterbox.cpp)    |  —   |  —    |  **4.42** | 6.48 | **0.68× (1.5× real-time)** |
+
+(For ggml the T3 GGUF load overlaps with prompt-graph construction, so
+split load/gen numbers are ambiguous; only the total wall time is
+directly comparable.)
+
+**Stage breakdown for ggml Q4_0** (the recommended production preset):
+
+| Stage                                    | time   |
+|------------------------------------------|-------:|
+| T3 load + T3 inference (~161 tokens)     | 2.08 s |
+| S3Gen GGUF load (1945 tensors)           | 0.37 s |
+| S3Gen encoder + CFM + HiFT               | 1.97 s |
+| **Total wall**                           | **4.42 s** |
+
+**Headline numbers:**
+
+- **ggml Q4_0 is 2.53× faster than ONNX q4 end-to-end on identical
+  hardware** (11.17 s → 4.42 s).
+- Even **ggml F16 beats ONNX q4** (5.71 s vs 11.17 s, 1.96× faster),
+  despite being 2× the weights — i.e. the ONNX backend loses to an
+  un-quantized ggml build on the same CPU.
+- **Load alone** for ONNX (4.30 s, the four ONNX models come up one by
+  one) already exceeds the *total* wall time of any ggml Q* variant.
+- **RTF < 1** (faster than real-time) only happens on the ggml side;
+  ONNX trails at 1.9× real-time for this prompt.
+
 ---
 
 ## Verification approach
