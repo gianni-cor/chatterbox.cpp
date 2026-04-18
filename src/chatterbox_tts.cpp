@@ -28,6 +28,16 @@
 #include "gguf.h"
 #include "npy.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -74,13 +84,43 @@ struct model_ctx {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
-static model_ctx load_s3gen_gguf(const std::string & path) {
+static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
+#ifdef GGML_USE_CUDA
+    if (n_gpu_layers > 0) {
+        auto * b = ggml_backend_cuda_init(0);
+        if (b) { fprintf(stderr, "s3gen: using CUDA backend\n"); return b; }
+    }
+#endif
+#ifdef GGML_USE_METAL
+    if (n_gpu_layers > 0) {
+        auto * b = ggml_backend_metal_init();
+        if (b) { fprintf(stderr, "s3gen: using Metal backend\n"); return b; }
+    }
+#endif
+#ifdef GGML_USE_VULKAN
+    if (n_gpu_layers > 0) {
+        auto * b = ggml_backend_vk_init(0);
+        if (b) {
+            char desc[256] = {0};
+            ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+            fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
+            return b;
+        }
+    }
+#endif
+    auto * b = ggml_backend_cpu_init();
+    if (!b) throw std::runtime_error("ggml_backend_cpu_init() failed");
+    fprintf(stderr, "s3gen: using CPU backend\n");
+    return b;
+}
+
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
-    m.backend = ggml_backend_cpu_init();
+    m.backend = s3gen_init_backend(n_gpu_layers);
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
@@ -125,6 +165,31 @@ static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * ker
     ggml_tensor * v = ggml_view_3d(ctx, out, L_new, out->ne[1], out->ne[2],
                                    out->nb[1], out->nb[2], (size_t)padding * out->nb[0]);
     return ggml_cont(ctx, v);
+}
+
+// Metal backend currently has no PAD / PAD_EXT dispatcher entry, so emulate
+// front/back zero padding on dim 0 via concat(scale(view, 0), x) /
+// concat(x, scale(view, 0)).  The scale(..., 0) trick produces a defined
+// zero tensor (as opposed to allocating an uninitialised one and hoping).
+static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
+    if (p_front <= 0 && p_back <= 0) return x;
+    ggml_tensor * y = x;
+    if (p_front > 0) {
+        GGML_ASSERT(p_front <= (int)x->ne[0]);
+        ggml_tensor * head = ggml_view_4d(ctx, x, p_front, x->ne[1], x->ne[2], x->ne[3],
+                                           x->nb[1], x->nb[2], x->nb[3], 0);
+        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
+        y = ggml_concat(ctx, z, y, 0);
+    }
+    if (p_back > 0) {
+        GGML_ASSERT(p_back <= (int)x->ne[0]);
+        ggml_tensor * tail = ggml_view_4d(ctx, x, p_back, x->ne[1], x->ne[2], x->ne[3],
+                                           x->nb[1], x->nb[2], x->nb[3],
+                                           (size_t)(x->ne[0] - p_back) * x->nb[0]);
+        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
+        y = ggml_concat(ctx, y, z, 0);
+    }
+    return y;
 }
 
 static ggml_tensor * ggml_mish_fn(ggml_context * ctx, ggml_tensor * x) {
@@ -226,7 +291,7 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
 
     ggml_tensor * ac = ggml_mul_mat(ctx, k_perm, q_plus_u);
     ggml_tensor * bd = ggml_mul_mat(ctx, p_perm, q_plus_v);
-    ggml_tensor * bd_padded = ggml_pad_ext(ctx, bd, 1, 0, 0, 0, 0, 0, 0, 0);
+    ggml_tensor * bd_padded = zero_pad_dim0(ctx, bd, 1, 0);
     ggml_tensor * bd_viewed = ggml_reshape_3d(ctx, bd_padded, T, 2*T, H);
     ggml_tensor * bd_sliced = ggml_view_3d(ctx, bd_viewed, T, 2*T - 1, H,
                                            bd_viewed->nb[1], bd_viewed->nb[2], bd_viewed->nb[1]);
@@ -316,11 +381,11 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_tensor * pb1 = find_tensor(m, "flow/encoder/pre_lookahead/conv1/b");
     ggml_tensor * pw2 = find_tensor(m, "flow/encoder/pre_lookahead/conv2/w");
     ggml_tensor * pb2 = find_tensor(m, "flow/encoder/pre_lookahead/conv2/b");
-    xt = ggml_pad_ext(ctx, xt, 0, 3, 0, 0, 0, 0, 0, 0);
+    xt = zero_pad_dim0(ctx, xt, 0, 3);
     xt = conv1d_f32(ctx, pw1, xt, 1, 0, 1);
     xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, pb1, 1, D));
     xt = ggml_leaky_relu(ctx, xt, 0.01f, false);
-    xt = ggml_pad_ext(ctx, xt, 2, 0, 0, 0, 0, 0, 0, 0);
+    xt = zero_pad_dim0(ctx, xt, 2, 0);
     xt = conv1d_f32(ctx, pw2, xt, 1, 0, 1);
     xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, pb2, 1, D));
     xt = ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
@@ -339,7 +404,7 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_tensor * xu_3d = ggml_reshape_3d(ctx, xu, 1, xu->ne[0], xu->ne[1]);
     ggml_tensor * xu_2x = ggml_concat(ctx, xu_3d, xu_3d, 0);
     xu = ggml_cont(ctx, ggml_reshape_2d(ctx, xu_2x, xu_3d->ne[1]*2, xu_3d->ne[2]));
-    xu = ggml_pad_ext(ctx, xu, 4, 0, 0, 0, 0, 0, 0, 0);
+    xu = zero_pad_dim0(ctx, xu, 4, 0);
     xu = conv1d_f32(ctx, up_w, xu, 1, 0, 1);
     xu = ggml_add(ctx, xu, ggml_reshape_2d(ctx, up_b, 1, D));
     x = ggml_cont(ctx, ggml_permute(ctx, xu, 1, 0, 2, 3));
@@ -422,7 +487,7 @@ static cfm_resnet_w load_cfm_resnet(const model_ctx & m, const std::string & pfx
 static ggml_tensor * cfm_causal_block(ggml_context * ctx, ggml_tensor * x,
                                       ggml_tensor * conv_w, ggml_tensor * conv_b,
                                       ggml_tensor * ln_w, ggml_tensor * ln_b, int64_t C_out) {
-    ggml_tensor * xp = ggml_pad_ext(ctx, x, 2, 0, 0, 0, 0, 0, 0, 0);
+    ggml_tensor * xp = zero_pad_dim0(ctx, x, 2, 0);
     ggml_tensor * y = conv1d_f32(ctx, conv_w, xp, 1, 0, 1);
     y = ggml_add(ctx, y, ggml_reshape_2d(ctx, conv_b, 1, C_out));
     y = layer_norm_on_channel(ctx, y, ln_w, ln_b);
@@ -513,7 +578,7 @@ static ggml_tensor * apply_tfm_stack(ggml_context * ctx, const cfm_tfm_stack & s
 
 static ggml_tensor * cfm_causal_k3(ggml_context * ctx, ggml_tensor * x,
                                    ggml_tensor * w, ggml_tensor * b, int C_out) {
-    ggml_tensor * xp = ggml_pad_ext(ctx, x, 2, 0, 0, 0, 0, 0, 0, 0);
+    ggml_tensor * xp = zero_pad_dim0(ctx, x, 2, 0);
     ggml_tensor * y = conv1d_f32(ctx, w, xp, 1, 0, 1);
     return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C_out));
 }
@@ -1198,10 +1263,31 @@ int s3gen_synthesize_to_wav(
 
     fprintf(stderr, "Loading %s\n", gguf_path.c_str());
     double load_t0 = now_ms();
-    model_ctx m = load_s3gen_gguf(gguf_path);
+    model_ctx m = load_s3gen_gguf(gguf_path, opts.n_gpu_layers);
     const double load_ms = now_ms() - load_t0;
     fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
     fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
+
+    // Metal backend currently makes HiFT decode ~100x slower than CPU because
+    // the conv_transpose_1d upsample kernels and some of the reshape-heavy
+    // residual blocks either fall back op-by-op or hit a pathological shader
+    // path.  Encoder + CFM are fine on Metal; HiFT/F0/STFT are the pain.
+    // Workaround: load a second CPU copy of the S3Gen GGUF and run the
+    // HiFT-side graphs there.  ~1 GB extra memory, but we stay fast end-to-end.
+    // CUDA / Vulkan don't need this (they run HiFT quickly).
+#ifdef GGML_USE_METAL
+    const bool hift_on_cpu = ggml_backend_is_metal(m.backend);
+#else
+    const bool hift_on_cpu = false;
+#endif
+    model_ctx m_hift_storage;
+    if (hift_on_cpu) {
+        fprintf(stderr, "  loading CPU copy of S3Gen for HiFT (Metal conv_transpose_1d workaround)...\n");
+        double t_cpu0 = now_ms();
+        m_hift_storage = load_s3gen_gguf(gguf_path, /*n_gpu_layers=*/0);
+        fprintf(stderr, "  HiFT CPU copy loaded (%.1f ms)\n", now_ms() - t_cpu0);
+    }
+    const model_ctx & m_hift = hift_on_cpu ? m_hift_storage : m;
 
     // If no --ref-dir, pull the built-in voice from the GGUF.
     if (ref_dir.empty()) {
@@ -1464,7 +1550,9 @@ int s3gen_synthesize_to_wav(
     // 9) HiFT
     double hift_t0 = now_ms();
     fprintf(stderr, "Running f0_predictor...\n");
-    auto f0 = run_f0_predictor(m, mel, T_mel);
+    double t0 = now_ms();
+    auto f0 = run_f0_predictor(m_hift, mel, T_mel);
+    fprintf(stderr, "  [f0_predictor] %.1f ms\n", now_ms() - t0);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
@@ -1472,20 +1560,26 @@ int s3gen_synthesize_to_wav(
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
 
     fprintf(stderr, "Running SineGen...\n");
+    t0 = now_ms();
     std::vector<float> l_linear_w(9);
-    ggml_tensor * llw = find_tensor(m, "hift/m_source/l_linear/weight");
-    ggml_tensor * llb = find_tensor(m, "hift/m_source/l_linear/bias");
+    ggml_tensor * llw = find_tensor(m_hift, "hift/m_source/l_linear/weight");
+    ggml_tensor * llb = find_tensor(m_hift, "hift/m_source/l_linear/bias");
     ggml_backend_tensor_get(llw, l_linear_w.data(), 0, 9 * sizeof(float));
     float l_linear_b;
     ggml_backend_tensor_get(llb, &l_linear_b, 0, sizeof(float));
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
+    fprintf(stderr, "  [sinegen] %.1f ms\n", now_ms() - t0);
 
     fprintf(stderr, "Running STFT...\n");
-    auto s_stft = run_stft(m, src);
+    t0 = now_ms();
+    auto s_stft = run_stft(m_hift, src);
+    fprintf(stderr, "  [stft] %.1f ms\n", now_ms() - t0);
     int T_stft = (int)(s_stft.size() / 18);
 
     fprintf(stderr, "Running HiFT decode...\n");
-    auto wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
+    t0 = now_ms();
+    auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft);
+    fprintf(stderr, "  [hift_decode] %.1f ms\n", now_ms() - t0);
     fprintf(stderr, "  [hift_total] %.1f ms\n", now_ms() - hift_t0);
     fprintf(stderr, "  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
 

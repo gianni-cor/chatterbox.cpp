@@ -664,6 +664,17 @@ static ggml_tensor * build_transformer_core(
     const auto & hp = model.hparams;
     const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = hp.n_ctx;
 
+    // Causal attention mask for soft_max_ext. Shape [n_kv, N] broadcast over heads.
+    // We use soft_max_ext instead of diag_mask_inf + soft_max because not every
+    // backend (notably Metal) implements the fused DIAG_MASK_INF op.
+    // For the single-step path (N=1) every KV position is allowed, so no mask is needed.
+    ggml_tensor * kq_mask = nullptr;
+    if (N > 1) {
+        kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_past + N, N);
+        ggml_set_name(kq_mask, "kq_mask");
+        ggml_set_input(kq_mask);
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * cur;
         cur = ggml_norm(ctx, inpL, hp.eps);
@@ -691,10 +702,11 @@ static ggml_tensor * build_transformer_core(
                 n_embd/n_head, n_head, n_past+N),
             0,2,1,3);
 
-        ggml_tensor * KQ = ggml_soft_max(ctx,
-            ggml_diag_mask_inf(ctx,
-                ggml_scale(ctx, ggml_mul_mat(ctx, K, Q), 1.0f/std::sqrt((float)n_embd/n_head)),
-                n_past));
+        ggml_tensor * KQ = ggml_soft_max_ext(ctx,
+            ggml_mul_mat(ctx, K, Q),
+            kq_mask,
+            1.0f/std::sqrt((float)n_embd/n_head),
+            0.0f);
 
         ggml_tensor * V_trans = ggml_cont_3d(ctx,
             ggml_permute(ctx,
@@ -805,6 +817,20 @@ static bool eval_prompt(
     std::vector<int32_t> pos(prompt_len);
     for (int i = 0; i < prompt_len; ++i) pos[i] = i;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), pos.data(), 0, pos.size()*sizeof(int32_t));
+
+    {
+        const int N = prompt_len;
+        ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
+        if (kq_mask) {
+            std::vector<float> mask((size_t)N * N, 0.0f);
+            for (int q = 0; q < N; ++q) {
+                for (int k = 0; k < N; ++k) {
+                    if (k > q) mask[(size_t)q * N + k] = -INFINITY;
+                }
+            }
+            ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(float));
+        }
+    }
 
     if (ggml_backend_is_cpu(model.backend)) ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     ggml_backend_graph_compute(model.backend, gf);

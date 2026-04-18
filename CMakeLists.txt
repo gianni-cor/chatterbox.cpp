@@ -98,3 +98,7 @@ endif()
 if (GGML_METAL)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_METAL)
 endif()
+
+if (GGML_VULKAN)
+    target_compile_definitions(chatterbox PRIVATE GGML_USE_VULKAN)
+endif()
