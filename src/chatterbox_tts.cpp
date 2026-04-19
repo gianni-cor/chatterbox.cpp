@@ -1573,6 +1573,16 @@ int s3gen_synthesize_to_wav(
             fprintf(stderr, "    [dxdt step%zu] max_abs=%.4e rms=%.4e vs ref\n", s, ma, std::sqrt(rsum / n));
         }
 
+        // Streaming: dump step0 dxdt for per-chunk bisection.
+        if (s == 0 && !opts.dump_mel_path.empty()) {
+            std::string base = opts.dump_mel_path;
+            if (base.size() > 4 && base.substr(base.size() - 4) == ".npy")
+                base.resize(base.size() - 4);
+            npy_save_f32(base + "_step0_dxdt.npy", {MEL, (int64_t)T_mu}, dxdt.data());
+            fprintf(stderr, "  [stream] dumped step0_dxdt (%d, %d) → %s_step0_dxdt.npy\n",
+                    MEL, T_mu, base.c_str());
+        }
+
         for (size_t i = 0; i < z.size(); ++i) z[i] = z[i] + dt * dxdt[i];
     }
     fprintf(stderr, "  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);

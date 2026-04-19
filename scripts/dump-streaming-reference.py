@@ -275,6 +275,18 @@ def main() -> None:
                                      meanflow=meanflow)
     tts.s3gen.flow.decoder.forward = _decoder_forward_capture
 
+    # Capture the first-step dxdt (estimator output for step 0) so we can
+    # bisect: if this matches C++, divergence is in the Euler integration or
+    # step 1; if it doesn't, divergence is inside the estimator itself.
+    captured_step0 = {"dxdt": None}
+    orig_estimator_forward = tts.s3gen.flow.decoder.estimator.forward
+    def _est_forward_capture(x, mask, mu, t, spks=None, cond=None, r=None):
+        out = orig_estimator_forward(x, mask, mu, t, spks=spks, cond=cond, r=r)
+        if captured_step0["dxdt"] is None:
+            captured_step0["dxdt"] = out.detach().clone().cpu()
+        return out
+    tts.s3gen.flow.decoder.estimator.forward = _est_forward_capture
+
     for k, end in enumerate(boundaries[1:], start=1):
         is_last = (end == n_speech)
         tokens_so_far = speech_tokens[:end]
@@ -284,6 +296,7 @@ def main() -> None:
 
         captured_z["z"] = None
         captured_mu["mu"] = None
+        captured_step0["dxdt"] = None
         _torch.randn_like = _capture_randn_like
         try:
             with torch.no_grad():
@@ -309,6 +322,10 @@ def main() -> None:
             if t is None: continue
             arr = t.squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_dec_{name}.npy", np.ascontiguousarray(arr))
+        if captured_step0["dxdt"] is not None:
+            # estimator output shape (1, 80, T_mu); save as (80, T_mu).
+            dxdt = captured_step0["dxdt"].squeeze(0).numpy().astype(np.float32)
+            np.save(args.out / f"chunk_{k:02d}_step0_dxdt.npy", np.ascontiguousarray(dxdt))
 
         # How many NEW mel frames this chunk produces (beyond the last
         # chunk's emission):
@@ -361,6 +378,7 @@ def main() -> None:
 
     _mu_hook_handle.remove()
     tts.s3gen.flow.decoder.forward = _orig_decoder_forward
+    tts.s3gen.flow.decoder.estimator.forward = orig_estimator_forward
     np.save(args.out / "streamed_wav.npy", np.ascontiguousarray(streamed_wav))
 
     # Numerical comparison.  We can't expect bit-exact equality: HiFT's
