@@ -762,6 +762,19 @@ static std::vector<float> cfm_estimator_forward(
     ggml_gallocr_reserve(cache.allocr, gf);
     }  // end graph-build block
 
+    // Tried: run one dummy compute right after gallocr_reserve to pre-warm
+    // Vulkan's first-dispatch state (shader residency / memory pool / command
+    // pool warmup), hoping the real step0 would then run at step1 speed
+    // (~12 ms instead of ~83 ms).  Outcome: the cold-compute cost is
+    // per-dispatch, not per-graph-first-dispatch — adding the warmup just
+    // shifted 70 ms from "hidden first-dispatch" to "explicit extra compute"
+    // without reducing step0.  S3GEN_INFER went UP by ~13 ms.  Reverted.
+    // The 83→12 ms gap appears to be a driver/scheduler warm-up cost on the
+    // first command buffer submission that no amount of dummy work inside
+    // cfm_estimator_forward removes.  Real fix would need to move the first
+    // dispatch elsewhere in the pipeline (e.g. during T3→S3Gen transition)
+    // so it overlaps with other host work, which is a bigger refactor.
+
 compute_only:
     ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
