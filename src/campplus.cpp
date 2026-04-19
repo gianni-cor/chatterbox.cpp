@@ -1,5 +1,8 @@
 #include "campplus.h"
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -7,10 +10,17 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+// Forward declaration for the ggml-backed implementation lives in
+// campplus_forward.inc (included at the bottom of this file).
+static bool campplus_embed_ggml(const std::vector<float> & fbank_t_by_c, int T,
+                                const campplus_weights & w, ggml_backend_t backend,
+                                std::vector<float> & out);
 
 // =============================================================================
 // GGUF loader helpers
@@ -584,8 +594,11 @@ static void stats_pool(const float * x, int C, int T, float * out)
 // Top-level forward
 // =============================================================================
 
-bool campplus_embed(const std::vector<float> & fbank_t_by_c, int T,
-                    const campplus_weights & w, std::vector<float> & out)
+// Legacy scalar CPU forward.  Kept for the CPU test harness and as a fallback
+// when the caller explicitly passes backend == nullptr.  The ggml-backed
+// public entry point follows it at the bottom of the file.
+static bool campplus_embed_cpu(const std::vector<float> & fbank_t_by_c, int T,
+                               const campplus_weights & w, std::vector<float> & out)
 {
     if ((int64_t)fbank_t_by_c.size() != (int64_t)T * w.feat_dim) {
         fprintf(stderr, "campplus_embed: fbank has %zu elts, expected %d*%d\n",
@@ -667,4 +680,20 @@ bool campplus_embed(const std::vector<float> & fbank_t_by_c, int T,
 
     out = std::move(emb);
     return true;
+}
+
+// =============================================================================
+// Public API: route through ggml graph when a backend is supplied, fall back
+// to the scalar CPU path otherwise (test harnesses, legacy callers).
+// =============================================================================
+
+#include "campplus_forward.inc"
+
+bool campplus_embed(const std::vector<float> & fbank_t_by_c, int T,
+                    const campplus_weights & w,
+                    ggml_backend_t backend,
+                    std::vector<float> & out)
+{
+    if (backend) return campplus_embed_ggml(fbank_t_by_c, T, w, backend, out);
+    return campplus_embed_cpu(fbank_t_by_c, T, w, out);
 }

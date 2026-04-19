@@ -209,10 +209,11 @@ std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav,
 namespace {
 
 struct encoder_ctx {
-    ggml_backend_t          backend = nullptr;
-    ggml_context         *  ctx     = nullptr;       // tensor context
-    ggml_backend_buffer_t   buffer  = nullptr;        // weight + scratch buffer
-    ggml_gallocr_t          alloc   = nullptr;
+    ggml_backend_t          backend      = nullptr;
+    bool                    owns_backend = false;    // true iff we created the backend internally
+    ggml_context         *  ctx          = nullptr;   // tensor context
+    ggml_backend_buffer_t   buffer       = nullptr;   // weight + scratch buffer
+    ggml_gallocr_t          alloc        = nullptr;
 
     // Layer-local weight tensor pointers (owned by ctx).
     ggml_tensor * mel_in = nullptr;
@@ -325,10 +326,17 @@ static ggml_tensor * add_weight_f32_3d(ggml_context * ctx, int64_t a, int64_t b,
 
 } // namespace
 
-static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w)
+static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
+                               ggml_backend_t backend)
 {
-    ec.backend = ggml_backend_cpu_init();
-    if (!ec.backend) { fprintf(stderr, "s3tokv2: ggml_backend_cpu_init failed\n"); return false; }
+    if (backend) {
+        ec.backend      = backend;
+        ec.owns_backend = false;
+    } else {
+        ec.backend      = ggml_backend_cpu_init();
+        ec.owns_backend = true;
+        if (!ec.backend) { fprintf(stderr, "s3tokv2: ggml_backend_cpu_init failed\n"); return false; }
+    }
 
     // Enough tensors: stem (4) + 16*6 blocks = 100.  Bump a bit for safety.
     const int n_tensors = 4 + 16 * w.n_layer + 8;
@@ -416,7 +424,10 @@ static void free_encoder_ctx(encoder_ctx & ec) {
     if (ec.alloc)  { ggml_gallocr_free(ec.alloc);  ec.alloc = nullptr; }
     if (ec.buffer) { ggml_backend_buffer_free(ec.buffer); ec.buffer = nullptr; }
     if (ec.ctx)    { ggml_free(ec.ctx); ec.ctx = nullptr; }
-    if (ec.backend){ ggml_backend_free(ec.backend); ec.backend = nullptr; }
+    if (ec.backend && ec.owns_backend) {
+        ggml_backend_free(ec.backend);
+    }
+    ec.backend = nullptr;
 }
 
 // Build the encoder computation graph for a mel input of shape (n_mels, T_mel).
@@ -549,7 +560,8 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
                       const s3tokv2_weights & w,
                       int max_tokens,
                       std::vector<int32_t> & out_tokens,
-                      int n_threads)
+                      int n_threads,
+                      ggml_backend_t backend)
 {
     int T_mel = 0;
     std::vector<float> mel = s3tokv2_log_mel(wav, w, T_mel);
@@ -560,7 +572,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
     const int T2 = (T1    + 2 - 2 - 1) / 2 + 1;
 
     encoder_ctx ec;
-    if (!build_encoder_ctx(ec, w)) { free_encoder_ctx(ec); return false; }
+    if (!build_encoder_ctx(ec, w, backend)) { free_encoder_ctx(ec); return false; }
 
     // Allocate the per-run input + positions tensors in a separate sub-context.
     // (They have a variable size that depends on T_mel/T2, so we can't bake

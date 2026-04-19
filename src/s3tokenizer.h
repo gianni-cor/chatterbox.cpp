@@ -27,6 +27,7 @@
 #include <vector>
 
 struct ggml_tensor;
+typedef struct ggml_backend * ggml_backend_t;
 
 // Flat pointer-to-(cloned-f32-vector) model.  Every tensor is loaded eagerly
 // into a std::vector<float> so we don't keep the GGUF mmap pinned.
@@ -100,8 +101,15 @@ std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav_16k,
 // Run the full encoder + FSQ and return a flat vector of speech tokens.
 // If `max_tokens > 0`, the output is clipped to at most that many tokens
 // (matching s3tokenizer.forward(max_len=...)).
+//
+// `backend` controls where the conformer encoder graph runs.  Pass nullptr
+// to fall back on an internal ggml-cpu backend (the prior hard-coded path).
+// When voice cloning is done at request time, pass the main inference
+// backend to avoid shipping weights through an extra CPU-side allocation
+// and to get Metal/Vulkan/CUDA kernels for the 6 transformer blocks.
 bool s3tokv2_tokenize(const std::vector<float> & wav_16k,
                       const s3tokv2_weights & w,
                       int max_tokens,
                       std::vector<int32_t> & out_tokens,
-                      int n_threads = 0);
+                      int n_threads = 0,
+                      ggml_backend_t backend = nullptr);

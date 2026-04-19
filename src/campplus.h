@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+typedef struct ggml_backend * ggml_backend_t;
+
 // -----------------------------------------------------------------------------
 // Weight containers
 // -----------------------------------------------------------------------------
@@ -134,9 +136,13 @@ bool campplus_load(const std::string & s3gen_gguf_path,
 //   fbank_t_by_c : row-major (T, 80) log-fbank at 16 kHz.  Per-utterance mean
 //                  over T must ALREADY be subtracted (that's what
 //                  extract_feature() in xvector.py does before forwarding).
+//   backend      : ggml backend used to run the forward graph.  Pass nullptr
+//                  for the legacy scalar CPU path (used by test harnesses);
+//                  pass the main inference backend for Metal / Vulkan / CUDA.
 //   out          : 192-d speaker embedding (raw, NOT L2-normalised — matches
 //                  what prepare-voice.py stores in embedding.npy).
 bool campplus_embed(const std::vector<float> & fbank_t_by_c,
                     int T,
                     const campplus_weights & w,
+                    ggml_backend_t backend,
                     std::vector<float> & out);
