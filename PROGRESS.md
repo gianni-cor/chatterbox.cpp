@@ -1584,6 +1584,62 @@ Performance numbers on a 3.76 s utterance (9 s of reference audio):
 
 ##### Phase 3b (per-chunk RTF tuning) — ✅ DONE (2026-04-12)
 
+**What actually changed — plain English.**  Before this phase, each
+streaming chunk had to re-run the encoder and CFM on the *whole*
+speech so far (so chunk 5 did more work than chunk 1), and CFM always
+did 2 Euler steps because that's what Python does. Result: each chunk
+took ~1.5 s to produce 1 s of audio, and the first chunk took ~1.3 s
+before you heard anything.
+
+Two new `chatterbox` CLI flags, no change to the model:
+
+- **`--stream-first-chunk-tokens N`** — the first chunk uses N tokens;
+  every chunk after that uses `--stream-chunk-tokens`. So you can make
+  the first chunk small (≈10 tokens / 0.4 s of audio) to get audio out
+  fast, and keep subsequent chunks big (≈50 tokens / 2 s) to amortise
+  the fixed per-chunk overhead. Code is ~10 lines in `src/main.cpp` —
+  just a boundary-building change, no pipeline rewrite.
+
+- **`--stream-cfm-steps N`** — override the hard-coded CFM step count
+  (2 for Python's meanflow). Setting `N=1` literally halves CFM compute
+  per chunk, because CFM is just a 2-step Euler loop. The
+  meanflow-trained model is *designed* to be sampled in 1 step (per
+  the meanflow paper — "mean" means the ODE can be collapsed to one
+  jump); this isn't a hack, it's using the model the way it was
+  trained to be usable. There's a quality trade — 1-step is a bit
+  noisier than 2-step (log-mag MAE ≈ 0.5) — so default stays at 2.
+  Flag is opt-in. Change is ~5 lines in `chatterbox_tts.cpp` where
+  `t_span = {0, 0.5, 1}` used to be hard-coded.
+
+Recommended low-latency preset:
+
+```bash
+./build/chatterbox --model t3.gguf --s3gen-gguf s3gen.gguf \
+    --text "…" --out out.wav \
+    --stream-first-chunk-tokens 10 \
+    --stream-chunk-tokens 50 \
+    --stream-cfm-steps 1
+```
+
+First audio out in ≈ 800 ms; middle chunks run at RTF 0.65 so the
+streamer stays ahead of playback on a 4-thread CPU. Numbers below.
+
+**What I did _not_ do.**  The earlier prose promised "incremental
+encoder / KV-cached CFM". That would mean: chunk 5 only re-processes
+the 25 new tokens, reusing intermediate activations saved from chunks
+1–4 — like the KV cache in an LLM decoder. I didn't do that, because
+the model isn't built for it. I verified the Python reference: both
+the flow encoder and the CFM estimator do full *bidirectional*
+self-attention (every output position looks at every input position,
+both directions, `static_chunk_size = 0`). Reusing previous-chunk
+activations requires attention that only looks leftward (causal) or
+only within fixed windows (chunked-causal). That's baked into the
+trained weights — you can't retrofit it in C++, the model would need
+to be retrained. So instead of "KV-cached CFM" I shipped "cheaper
+CFM" (1-step) and "smarter chunk boundaries" (small first, big
+after). Different optimisations, same user-visible win — fast first
+audio, streaming keeps up.
+
 Per-chunk profiling on the same 4.9 s utterance:
 
 | stage | cost per chunk (T_mu≈650) |
