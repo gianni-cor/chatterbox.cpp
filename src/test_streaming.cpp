@@ -107,7 +107,12 @@ int main(int argc, char ** argv) {
         // Inject Python's exact per-chunk CFM noise so the two pipelines
         // become bit-exact comparable (bypasses the torch.randn vs
         // std::mt19937 divergence).
-        const std::string z_path = ref + "/chunk_" + kbuf + "_cfm_z.npy";
+        // Use chunk_KK_step0_x_in.npy (the ACTUAL z passed into estimator.forward
+        // at step 0 — includes the `noised_mels` overlay from flow_inference).
+        // The older chunk_KK_cfm_z.npy only captured the first torch.randn_like
+        // call and missed the meanflow-specific speech-region overwrite, which
+        // caused post-prompt divergence.
+        const std::string z_path = ref + "/chunk_" + kbuf + "_step0_x_in.npy";
         if (path_exists(z_path)) {
             npy_array z = npy_load(z_path);
             const float * zp = (const float *)z.data.data();

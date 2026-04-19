@@ -1474,6 +1474,59 @@ Python byte-for-byte or seams click.
 Impact: **first audio chunk out in ~200–400 ms** instead of 2+ s. Turns
 the binary from "batch" into "live".
 
+##### Phase 2 (CFM bit-exact parity) — ✅ DONE (2026-04-12)
+
+Before shipping the streaming binary we needed the per-chunk C++ mel to
+match Python to float32 precision. The per-chunk harness
+(`src/test_streaming.cpp` + `scripts/dump-streaming-reference.py`) now
+reports `worst rel = 8.67e-07` for both chunks (i.e. machine epsilon) on
+the `test.wav` reference.
+
+The last bug found was subtle: Chatterbox's turbo flow runs CFM in
+**meanflow** mode, which means `flow_inference` allocates a
+*second* noise tensor
+
+```python
+noise = torch.randn(1, 80, speech_tokens.size(-1) * 2, ...)
+super().forward(..., noised_mels=noise)
+```
+
+and `flow_matching.forward` silently **overwrites the speech region of
+`z`**:
+
+```python
+z = torch.randn_like(mu) * temperature
+if noised_mels is not None:
+    prompt_len = mu.size(2) - noised_mels.size(2)
+    z[..., prompt_len:] = noised_mels   # ← second randn draw lives here
+```
+
+Our original Python capture hook wrapped only `torch.randn_like`, so the
+saved `chunk_KK_cfm_z.npy` contained the *first* draw everywhere,
+including positions `t ≥ prompt_len` that are actually overwritten by
+the second draw. Injecting that stale `z` as `cfm_z0_override` in C++
+produced CFM output that matched Python bit-exactly in the prompt
+region (`t < 500`) and diverged wildly in the speech region (`t ≥ 500`)
+— exactly the "receptive field of the prompt/speech boundary" pattern
+we were chasing.
+
+Fix (commit [`2e82cce`](https://github.com/gianni-cor/chatterbox.cpp/commit/2e82cce)
+and the follow-up in this section):
+- Replace the `torch.randn_like` capture with a wrapper around
+  `CausalConditionalCFM.basic_euler` that records the full `x` tensor
+  at the first `estimator.forward` call. That tensor *is* the real z
+  after the meanflow overlay.
+- Dump it as `chunk_KK_step0_x_in.npy`; `test-streaming` loads that
+  (instead of the old `chunk_KK_cfm_z.npy`) into `cfm_z0_override`.
+- All four CFM inputs (`mu`, `mask`, `spks`, `cond`) already matched at
+  rel ≤ 3e-7, so fixing `z` made the estimator output match at rel ≈
+  machine epsilon.
+
+Lessons: in streaming validation harnesses, capture *the exact tensor
+the target op receives*, not an earlier upstream value. Monkeypatching
+a function that a caller later post-processes (`z[...] = …`) is a
+silent source of divergence.
+
 #### B2. Server mode with persistent graphs
 
 Every invocation currently pays ~200–400 ms fixed cost for graph

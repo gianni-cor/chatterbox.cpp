@@ -239,53 +239,73 @@ def main() -> None:
 
     print(f"[3/3] streaming loop: {len(boundaries)-1} chunks × {chunk_tokens} tokens")
 
-    # Capture torch.randn_like (CFM's initial noise z) and encoder_proj output
-    # (CFM's `mu` conditioning) per chunk.  Both are fed to the C++ streaming
-    # harness so we can isolate where the mel divergence comes from — if mu
-    # matches and z matches, any remaining gap is CFM-internal.
-    import torch as _torch
-    orig_randn_like = _torch.randn_like
-    captured_z = {"z": None}
-    def _capture_randn_like(x, *a, **kw):
-        out = orig_randn_like(x, *a, **kw)
-        if captured_z["z"] is None:
-            captured_z["z"] = out.detach().clone().cpu()
-        return out
-
+    # Capture encoder_proj output (CFM's `mu` conditioning) for independent
+    # verification.  The FULL z passed into the estimator is captured below
+    # via the basic_euler wrapper — the earlier torch.randn_like hook was
+    # removed because in meanflow mode, `noised_mels` overwrites the
+    # speech region of z with a second randn draw, which the randn_like
+    # hook silently missed.
     captured_mu = {"mu": None}
     def _enc_proj_hook(mod, inp, out):
         captured_mu["mu"] = out.detach().clone().cpu()
     _mu_hook_handle = tts.s3gen.flow.encoder_proj.register_forward_hook(_enc_proj_hook)
 
-    # Also hook flow_matching.forward so we can capture the EXACT tensors
-    # the decoder sees: mu, mask, spks, cond.  If any of these diverge from
-    # what the C++ port constructs, per-chunk mel will drift even with
-    # identical z0.
+    # Hook flow_matching.forward so we capture the EXACT tensors the decoder
+    # sees (mu, mask, spks, cond), AND wrap basic_euler to grab the first-step
+    # inputs and output for bisection.  We go through the CFM's basic_euler
+    # wrapper because (a) it's the caller that actually invokes
+    # estimator.forward, and (b) its closure captures x after any dtype casts
+    # so we see exactly what the estimator receives.  nn.Module
+    # register_forward_hook won't fire here because basic_euler calls
+    # `self.estimator.forward(...)` directly (bypassing __call__).
     captured_decoder = {"mu": None, "mask": None, "spks": None, "cond": None}
-    _orig_decoder_forward = tts.s3gen.flow.decoder.forward
-    def _decoder_forward_capture(mu, mask, n_timesteps, temperature=1.0,
-                                  spks=None, cond=None, noised_mels=None,
-                                  meanflow=False):
+    captured_step0 = {"x_in": None, "mask": None, "mu": None, "t": None,
+                      "r": None, "spks": None, "cond": None, "dxdt": None}
+
+    _orig_basic_euler = tts.s3gen.flow.decoder.basic_euler
+    def _basic_euler_capture(x, t_span, mu, mask, spks, cond):
+        # stash decoder-level inputs (what C++ would pass in)
         captured_decoder["mu"]   = mu.detach().clone().cpu()
         captured_decoder["mask"] = mask.detach().clone().cpu()
         captured_decoder["spks"] = None if spks is None else spks.detach().clone().cpu()
         captured_decoder["cond"] = None if cond is None else cond.detach().clone().cpu()
-        return _orig_decoder_forward(mu, mask, n_timesteps, temperature=temperature,
-                                     spks=spks, cond=cond, noised_mels=noised_mels,
-                                     meanflow=meanflow)
-    tts.s3gen.flow.decoder.forward = _decoder_forward_capture
+        # wrap estimator to catch the first call
+        _orig_fwd = tts.s3gen.flow.decoder.estimator.forward
+        def _est(x, mask, mu, t, spks=None, cond=None, r=None):
+            out = _orig_fwd(x, mask, mu, t, spks=spks, cond=cond, r=r)
+            if captured_step0["dxdt"] is None:
+                captured_step0["x_in"] = x.detach().clone().cpu()
+                captured_step0["mask"] = mask.detach().clone().cpu()
+                captured_step0["mu"]   = mu.detach().clone().cpu()
+                captured_step0["t"]    = t.detach().clone().cpu()
+                captured_step0["r"]    = None if r is None else r.detach().clone().cpu()
+                captured_step0["spks"] = None if spks is None else spks.detach().clone().cpu()
+                captured_step0["cond"] = None if cond is None else cond.detach().clone().cpu()
+                captured_step0["dxdt"] = out.detach().clone().cpu()
+            return out
+        tts.s3gen.flow.decoder.estimator.forward = _est
+        try:
+            return _orig_basic_euler(x, t_span, mu, mask, spks, cond)
+        finally:
+            tts.s3gen.flow.decoder.estimator.forward = _orig_fwd
 
-    # Capture the first-step dxdt (estimator output for step 0) so we can
-    # bisect: if this matches C++, divergence is in the Euler integration or
-    # step 1; if it doesn't, divergence is inside the estimator itself.
-    captured_step0 = {"dxdt": None}
-    orig_estimator_forward = tts.s3gen.flow.decoder.estimator.forward
-    def _est_forward_capture(x, mask, mu, t, spks=None, cond=None, r=None):
-        out = orig_estimator_forward(x, mask, mu, t, spks=spks, cond=cond, r=r)
-        if captured_step0["dxdt"] is None:
-            captured_step0["dxdt"] = out.detach().clone().cpu()
-        return out
-    tts.s3gen.flow.decoder.estimator.forward = _est_forward_capture
+    tts.s3gen.flow.decoder.basic_euler = _basic_euler_capture
+
+    # Capture the FIRST forward pass of each down_block[0] inner module so we
+    # can bisect where the speech-region divergence starts.
+    cfm_stage_captures = {}
+    cfm_stage_hooks = []
+    def _stage_hook(key):
+        def _h(mod, inp, out):
+            if key not in cfm_stage_captures:
+                if isinstance(out, torch.Tensor):
+                    cfm_stage_captures[key] = out.detach().clone().cpu()
+        return _h
+    # down_blocks[0][0] is a CausalResnetBlock1D, [1] is transformer_blocks (ModuleList), [2] is downsample.
+    est = tts.s3gen.flow.decoder.estimator
+    cfm_stage_hooks.append(est.down_blocks[0][0].register_forward_hook(_stage_hook("cfm_d0_rn")))
+    cfm_stage_hooks.append(est.down_blocks[0][1][0].register_forward_hook(_stage_hook("cfm_d0_tfm0")))
+    cfm_stage_hooks.append(est.down_blocks[0][2].register_forward_hook(_stage_hook("cfm_d0_downsample")))
 
     for k, end in enumerate(boundaries[1:], start=1):
         is_last = (end == n_speech)
@@ -294,23 +314,14 @@ def main() -> None:
         np.save(args.out / f"chunk_{k:02d}_tokens.npy",
                 np.ascontiguousarray(tokens_so_far.cpu().numpy().astype(np.int32)))
 
-        captured_z["z"] = None
         captured_mu["mu"] = None
         captured_step0["dxdt"] = None
-        _torch.randn_like = _capture_randn_like
-        try:
-            with torch.no_grad():
-                mels = tts.s3gen.flow_inference(
-                    tokens_so_far, speech_token_lens=None,
-                    ref_dict=cond_gen, n_cfm_timesteps=2, finalize=is_last,
-                ).to(dtype=tts.s3gen.dtype)
-        finally:
-            _torch.randn_like = orig_randn_like
+        with torch.no_grad():
+            mels = tts.s3gen.flow_inference(
+                tokens_so_far, speech_token_lens=None,
+                ref_dict=cond_gen, n_cfm_timesteps=2, finalize=is_last,
+            ).to(dtype=tts.s3gen.dtype)
 
-        if captured_z["z"] is not None:
-            # z shape: (1, 80, T_mu).  Squeeze to (80, T_mu).
-            z_np = captured_z["z"].squeeze(0).numpy().astype(np.float32)
-            np.save(args.out / f"chunk_{k:02d}_cfm_z.npy", np.ascontiguousarray(z_np))
         if captured_mu["mu"] is not None:
             mu_np = captured_mu["mu"].squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_mu.npy", np.ascontiguousarray(mu_np))
@@ -322,10 +333,23 @@ def main() -> None:
             if t is None: continue
             arr = t.squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_dec_{name}.npy", np.ascontiguousarray(arr))
-        if captured_step0["dxdt"] is not None:
-            # estimator output shape (1, 80, T_mu); save as (80, T_mu).
-            dxdt = captured_step0["dxdt"].squeeze(0).numpy().astype(np.float32)
-            np.save(args.out / f"chunk_{k:02d}_step0_dxdt.npy", np.ascontiguousarray(dxdt))
+        # Save the whole step0 tuple (inputs AND output) — deterministic
+        # replay test: feed these inputs to the same estimator.forward and
+        # check the output matches bit-for-bit.
+        for name in ("x_in", "mask", "mu", "t", "r", "spks", "cond", "dxdt"):
+            t = captured_step0[name]
+            if t is None: continue
+            arr = t.numpy().astype(np.float32)
+            if arr.ndim >= 3:
+                arr = arr.squeeze(0)
+            np.save(args.out / f"chunk_{k:02d}_step0_{name}.npy", np.ascontiguousarray(arr))
+            captured_step0[name] = None
+        # Per-stage CFM dumps
+        for stage_key, tval in list(cfm_stage_captures.items()):
+            if tval is None: continue
+            arr = tval.squeeze(0).numpy().astype(np.float32)
+            np.save(args.out / f"chunk_{k:02d}_{stage_key}.npy", np.ascontiguousarray(arr))
+        cfm_stage_captures.clear()
 
         # How many NEW mel frames this chunk produces (beyond the last
         # chunk's emission):
@@ -377,8 +401,8 @@ def main() -> None:
               f"mels_new={mels_new_count}  wav={len(wav_k_np)} samples")
 
     _mu_hook_handle.remove()
-    tts.s3gen.flow.decoder.forward = _orig_decoder_forward
-    tts.s3gen.flow.decoder.estimator.forward = orig_estimator_forward
+    tts.s3gen.flow.decoder.basic_euler = _orig_basic_euler
+    for h in cfm_stage_hooks: h.remove()
     np.save(args.out / "streamed_wav.npy", np.ascontiguousarray(streamed_wav))
 
     # Numerical comparison.  We can't expect bit-exact equality: HiFT's

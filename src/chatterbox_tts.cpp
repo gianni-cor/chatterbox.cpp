@@ -1398,18 +1398,14 @@ int s3gen_synthesize_to_wav(
         for (int t = 0; t < T_mu; ++t)
             mu[m2 * T_mu + t] = mu_T[t * MEL + m2];
 
-    // Streaming debug: optionally dump the encoder_proj output (same as Python's
-    // `mu` tensor fed into flow_matching.forward) so the test harness can
-    // isolate encoder-side vs CFM-side divergence.
+    // Streaming debug: optionally dump the encoder_proj output (same as
+    // Python's `mu` tensor fed into flow_matching.forward) so the test
+    // harness can isolate encoder-side vs CFM-side divergence.
     if (!opts.dump_mel_path.empty()) {
-        std::string mu_path = opts.dump_mel_path;
-        if (mu_path.size() > 4 && mu_path.substr(mu_path.size() - 4) == ".npy") {
-            mu_path.replace(mu_path.size() - 4, 4, "_mu.npy");
-        } else {
-            mu_path += "_mu.npy";
-        }
-        npy_save_f32(mu_path, {(int64_t)T_mu, MEL}, mu_T.data());
-        fprintf(stderr, "  [stream] dumped mu (T_mu=%d, MEL=%d) → %s\n", T_mu, MEL, mu_path.c_str());
+        std::string base = opts.dump_mel_path;
+        if (base.size() > 4 && base.substr(base.size() - 4) == ".npy")
+            base.resize(base.size() - 4);
+        npy_save_f32(base + "_mu.npy", {(int64_t)T_mu, MEL}, mu_T.data());
     }
 
     // 4) Speaker embedding: F.normalize + spk_embed_affine_layer
@@ -1496,7 +1492,10 @@ int s3gen_synthesize_to_wav(
             T_mu, prompt_len_in_mu, n_speech_part);
     if (!opts.cfm_z0_override.empty()) {
         // Streaming validation path: use the exact noise Python used for
-        // this chunk so we can get bit-exact mel parity.
+        // this chunk so we can get bit-exact mel parity.  This override must
+        // be the FINAL z passed to the CFM estimator (i.e. including the
+        // speech-region overwrite that flow_matching.forward applies when
+        // `noised_mels` is not None in meanflow mode).
         if ((int64_t)opts.cfm_z0_override.size() != (int64_t)T_mu * MEL) {
             fprintf(stderr, "error: cfm_z0_override has %zu elements but T_mu*MEL=%d\n",
                     opts.cfm_z0_override.size(), T_mu * MEL);
