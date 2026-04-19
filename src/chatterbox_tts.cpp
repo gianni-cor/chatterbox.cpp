@@ -1570,8 +1570,15 @@ int s3gen_synthesize_to_wav(
                 z[m2 * T_mu + t] = gauss2(rng2);
     }
 
-    // 7) CFM loop: 2 steps with t_span = [0, 0.5, 1]
-    std::vector<float> t_span = {0.0f, 0.5f, 1.0f};
+    // 7) CFM loop: default 2-step meanflow (t_span = [0, 0.5, 1]); streaming
+    // callers can override via opts.cfm_steps = 1 for a single Euler jump
+    // (~2× CFM speedup at the cost of a small quality degradation — Turbo
+    // is meanflow-trained so 1-step is a valid sampling mode, just noisier).
+    std::vector<float> t_span;
+    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : 2;
+    t_span.reserve(cfm_steps + 1);
+    for (int i = 0; i <= cfm_steps; ++i)
+        t_span.push_back((float)i / (float)cfm_steps);
     cfm_estimator_cache cfm_cache;
     double cfm_t0 = now_ms();
     for (size_t s = 0; s < t_span.size() - 1; ++s) {

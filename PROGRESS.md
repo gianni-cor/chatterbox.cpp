@@ -1582,11 +1582,60 @@ Performance numbers on a 3.76 s utterance (9 s of reference audio):
 | first-audio-out | 2271 ms | **1340 ms** |
 | per-chunk RTF | 0.60 | 1.44 – 1.59 |
 
-Streaming wins on first-audio latency (−41 %) but pays for it in total
-wall time because each chunk re-runs the encoder/CFM on the cumulative
-token prefix (O(K²)). A proper incremental encoder / KV-cached CFM is
-needed to bring per-chunk RTF below 1 — that's a follow-up, not a
-blocker for the feature.
+##### Phase 3b (per-chunk RTF tuning) — ✅ DONE (2026-04-12)
+
+Per-chunk profiling on the same 4.9 s utterance:
+
+| stage | cost per chunk (T_mu≈650) |
+|---|---|
+| encoder (T_tokens≈350) | ~280 ms |
+| CFM step 0 | ~580 ms |
+| CFM step 1 | ~500 ms |
+| HiFT decode (1 s audio) | ~265 ms |
+| total | **~1630 ms for 1 s of audio** |
+
+CFM is ~2/3 of every chunk.  Two things that *don't* work for cutting
+it down without retraining:
+
+- **KV-cached CFM / incremental encoder** — Chatterbox's flow encoder
+  and CFM estimator both run full bidirectional self-attention.  I
+  verified `static_chunk_size = 0` in `decoder.py` (no chunked
+  attention mask) and that the encoder has no causal mask either.
+  Caching previous-chunk activations would require the attention to
+  be *causal* (or at least chunk-causal).  Retrofitting that at
+  inference time changes the output distribution — not a pure port.
+- **Prompt-region truncation** — the 500-frame prompt accounts for
+  ~70 % of T_mu and its CFM output is discarded every chunk.  But
+  attention is full, so any speech-region output depends on every
+  prompt frame via softmax.  Truncating to a short prompt tail would
+  require retraining.
+
+What *does* work, and is now shipped as tunables:
+
+- **Non-uniform chunk sizes** (`--stream-first-chunk-tokens N`).
+  First chunk stays small (≈10 tokens / 0.4 s audio) for fast
+  first-audio-out; subsequent chunks go big (≈50 tokens / 2 s audio)
+  so the fixed per-chunk encoder+CFM cost amortises over more output.
+- **Fewer CFM Euler steps** (`--stream-cfm-steps 1`).  Turbo is
+  meanflow-trained, and meanflow supports 1-step sampling per the
+  paper.  In practice 1-step introduces some audible high-frequency
+  noise (log-mag MAE ≈ 0.5 vs 2-step) but keeps content intact.
+  Default stays at 2 to match Python; users opt in via the flag.
+
+Measured on the same text on CPU:
+
+| config | first-audio | chunk-N RTF | overall RTF |
+|---|---|---|---|
+| baseline (`--stream-chunk-tokens 25`) | 1331 ms | 1.44 – 1.70 | 1.59 |
+| first-small (`10 → 25`) | 1156 ms | 1.37 – 1.69 | 1.84 |
+| 1-step + big (`50`, `steps=1`) | 1230 ms | 0.63 – 0.69 | 0.78 |
+| **combined (`10 → 50`, `steps=1`)** | **782 ms** | **0.63 – 0.69** | **0.94** |
+
+The "combined" preset hits both objectives at once: first audio out
+in ≤ 800 ms on CPU, and middle chunks complete in 2/3 of their audio
+duration so the streamer can stay ahead of playback.  Incremental
+encoder / KV-cached CFM stay on the backlog for when someone wants to
+retrain Chatterbox with chunk-causal attention.
 
 #### B2. Server mode with persistent graphs
 

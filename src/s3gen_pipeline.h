@@ -133,6 +133,11 @@ struct s3gen_synthesize_opts {
     bool                 apply_trim_fade       = true;
     std::vector<float> * hift_source_tail_out  = nullptr;
     int                  source_tail_samples   = 480;
+
+    // Number of Euler steps for the CFM meanflow sampler.  Python defaults
+    // to 2 for meanflow; setting this to 1 halves CFM cost at the price of
+    // some extra high-frequency noise.  0 → use the default (2).
+    int                  cfm_steps             = 0;
 };
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.

@@ -451,7 +451,16 @@ struct cli_params {
     // carried across chunks for phase continuity and `trim_fade` only on
     // chunk 0.  Per-chunk wavs are written next to --out (stream_chunk_K.wav)
     // and concatenated into --out when the loop finishes.
-    int32_t stream_chunk_tokens = 0;
+    int32_t stream_chunk_tokens       = 0;
+    // Optional: override first-chunk size (typically smaller than
+    // stream_chunk_tokens so first-audio-out is fast, then the pipeline
+    // switches to larger chunks to amortise the fixed per-chunk overhead).
+    // 0 → same as stream_chunk_tokens.
+    int32_t stream_first_chunk_tokens = 0;
+    // Optional: override CFM Euler step count for streaming chunks.  Defaults
+    // to 2 (matches Python's meanflow); setting 1 halves CFM cost at the
+    // price of a bit of extra high-frequency noise.
+    int32_t stream_cfm_steps          = 0;
 };
 
 static void print_usage(const char * argv0) {
@@ -495,6 +504,11 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          per-chunk wavs next to --out as\n");
     fprintf(stderr, "                          <out>_chunk_KK.wav and the full concatenation to --out.\n");
     fprintf(stderr, "                          Requires --s3gen-gguf.  (default: 0 = batch)\n");
+    fprintf(stderr, "  --stream-first-chunk-tokens N  Override first-chunk size to minimise first-audio\n");
+    fprintf(stderr, "                          latency.  Typical value: 10-15.  (default: 0 = same\n");
+    fprintf(stderr, "                          as --stream-chunk-tokens)\n");
+    fprintf(stderr, "  --stream-cfm-steps N    CFM Euler step count per chunk.  Python uses 2 for\n");
+    fprintf(stderr, "                          meanflow; 1 halves CFM cost.  (default: 0 = 2)\n");
     fprintf(stderr, "  -h, --help\n");
 }
 
@@ -526,6 +540,8 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--temp")           { auto v = next("--temp");           if (!v) return false; params.temp = std::stof(v); }
         else if (arg == "--repeat-penalty") { auto v = next("--repeat-penalty"); if (!v) return false; params.repeat_penalty = std::stof(v); }
         else if (arg == "--stream-chunk-tokens") { auto v = next("--stream-chunk-tokens"); if (!v) return false; params.stream_chunk_tokens = std::stoi(v); }
+        else if (arg == "--stream-first-chunk-tokens") { auto v = next("--stream-first-chunk-tokens"); if (!v) return false; params.stream_first_chunk_tokens = std::stoi(v); }
+        else if (arg == "--stream-cfm-steps") { auto v = next("--stream-cfm-steps"); if (!v) return false; params.stream_cfm_steps = std::stoi(v); }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
         else { fprintf(stderr, "error: unknown argument: %s\n", arg.c_str()); return false; }
@@ -1469,12 +1485,21 @@ int main(int argc, char ** argv) {
                 full_tokens.push_back(S3GEN_SIL);
                 full_tokens.push_back(S3GEN_SIL);
 
-                const int chunk_n = params.stream_chunk_tokens;
+                const int chunk_n       = params.stream_chunk_tokens;
+                const int first_chunk_n = params.stream_first_chunk_tokens > 0
+                                        ? params.stream_first_chunk_tokens
+                                        : chunk_n;
                 const int total_n = (int)full_tokens.size();
-                std::vector<int> boundaries;
-                for (int b = 0; b <= total_n; b += chunk_n)
-                    boundaries.push_back(std::min(b, total_n));
-                if (boundaries.back() != total_n) boundaries.push_back(total_n);
+                // Build boundaries.  First chunk may be smaller than the rest
+                // so first-audio-out lands early; subsequent chunks use the
+                // bigger `chunk_n` to keep per-chunk RTF low.
+                std::vector<int> boundaries = {0};
+                int cursor = std::min(first_chunk_n, total_n);
+                boundaries.push_back(cursor);
+                while (cursor < total_n) {
+                    cursor = std::min(cursor + chunk_n, total_n);
+                    boundaries.push_back(cursor);
+                }
 
                 std::vector<float> hift_cache_source;
                 std::vector<float> streamed_wav;
@@ -1506,6 +1531,7 @@ int main(int argc, char ** argv) {
                     std::vector<float> tail_out;
                     copts.hift_source_tail_out      = &tail_out;
                     copts.source_tail_samples       = 480;
+                    copts.cfm_steps                 = params.stream_cfm_steps;
 
                     fprintf(stderr, "\n--- chunk %d/%d: tokens_total=%d finalize=%s ---\n",
                             k, (int)boundaries.size() - 1, end, is_last ? "true" : "false");
