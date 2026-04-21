@@ -1288,8 +1288,12 @@ int s3gen_synthesize_to_wav(
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     g_n_threads = n_threads;
     vlog("Using %d threads\n", g_n_threads);
-    if (gguf_path.empty() || out_path.empty()) {
-        fprintf(stderr, "s3gen_synthesize_to_wav: s3gen_gguf_path and out_wav_path are required\n");
+    if (gguf_path.empty()) {
+        fprintf(stderr, "s3gen_synthesize_to_wav: s3gen_gguf_path is required\n");
+        return 1;
+    }
+    if (out_path.empty() && opts.pcm_out == nullptr) {
+        fprintf(stderr, "s3gen_synthesize_to_wav: at least one of out_wav_path or pcm_out must be set\n");
         return 1;
     }
     if (debug_mode && ref_dir.empty()) {
@@ -1822,8 +1826,13 @@ int s3gen_synthesize_to_wav(
             audio_ms / pipeline_total >= 1.0 ? audio_ms / pipeline_total : pipeline_total / audio_ms,
             audio_ms >= pipeline_total ? "faster than real-time" : "slower than real-time");
 
-    write_wav(out_path, wav, sr);
-    fprintf(stderr, "Wrote %s\n", out_path.c_str());
+    if (opts.pcm_out) {
+        *opts.pcm_out = wav;
+    }
+    if (!out_path.empty()) {
+        write_wav(out_path, wav, sr);
+        fprintf(stderr, "Wrote %s\n", out_path.c_str());
+    }
     return 0;
 }
 

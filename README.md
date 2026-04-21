@@ -404,10 +404,6 @@ You can also drop the `--out -` to get a regular wav:
 afplay out.wav
 ```
 
-In streaming mode per-chunk wavs are additionally written next to
-`--out` as `<out>_chunk_KK.wav` so you can scrub through individual
-chunks.
-
 **Latency and throughput** on an Apple M4 with the Metal backend and
 the preset above, feeding the sentence *"Hello from streaming
 Chatterbox, I am John and I work in Google since 2010. I love to go

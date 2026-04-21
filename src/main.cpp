@@ -470,8 +470,9 @@ struct cli_params {
     // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
     // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
     // carried across chunks for phase continuity and `trim_fade` only on
-    // chunk 0.  Per-chunk wavs are written next to --out (stream_chunk_K.wav)
-    // and concatenated into --out when the loop finishes.
+    // chunk 0.  Chunks are concatenated in memory and written to --out when
+    // the loop finishes, or piped to stdout as soon as each chunk finishes
+    // when --out is "-".  No per-chunk files are ever written.
     int32_t stream_chunk_tokens       = 0;
     // Optional: override first-chunk size (typically smaller than
     // stream_chunk_tokens so first-audio-out is fast, then the pipeline
@@ -527,10 +528,11 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --repeat-penalty R      (default: 1.2)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --stream-chunk-tokens N Synthesize the wav in streaming chunks of N speech\n");
-    fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  Writes\n");
-    fprintf(stderr, "                          per-chunk wavs next to --out as\n");
-    fprintf(stderr, "                          <out>_chunk_KK.wav and the full concatenation to --out.\n");
-    fprintf(stderr, "                          Requires --s3gen-gguf.  (default: 0 = batch)\n");
+    fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  With\n");
+    fprintf(stderr, "                          --out PATH.wav, the concatenated wav is written at the\n");
+    fprintf(stderr, "                          end; with --out -, each chunk's PCM is piped to stdout\n");
+    fprintf(stderr, "                          as soon as it's produced.  No per-chunk files are\n");
+    fprintf(stderr, "                          written.  Requires --s3gen-gguf.  (default: 0 = batch)\n");
     fprintf(stderr, "  --stream-first-chunk-tokens N  Override first-chunk size to minimise first-audio\n");
     fprintf(stderr, "                          latency.  Typical value: 10-15.  (default: 0 = same\n");
     fprintf(stderr, "                          as --stream-chunk-tokens)\n");
@@ -1584,17 +1586,12 @@ int main(int argc, char ** argv) {
                 int prev_mels_emitted = 0;
 
                 // `--out -` is the live-streaming mode: emit each chunk's
-                // PCM to stdout as it's produced (no per-chunk wav files
-                // left behind, no final concatenated wav — the consumer
-                // pipes stdout straight into a player).  Otherwise we
-                // write chunk_KK.wav next to --out and concat at the end.
+                // PCM to stdout as it's produced.  Otherwise the chunks are
+                // concatenated in memory and the full wav is written to
+                // `--out` at the end.  Per-chunk wav files are never written
+                // to disk — s3gen_synthesize_to_wav returns the float32 PCM
+                // in-memory via `pcm_out`.
                 const bool to_stdout = (params.out_wav == "-");
-                const std::string base = to_stdout
-                    ? std::string("/tmp/chatterbox_stream")
-                    : params.out_wav;
-                std::string base_noext = base;
-                if (base_noext.size() > 4 && base_noext.substr(base_noext.size()-4) == ".wav")
-                    base_noext.resize(base_noext.size()-4);
 
                 fprintf(stderr, "\n=== streaming synthesis: %d chunks of %d tokens%s ===\n",
                         (int)boundaries.size() - 1, chunk_n,
@@ -1608,8 +1605,9 @@ int main(int argc, char ** argv) {
                     std::vector<int32_t> toks(full_tokens.begin(), full_tokens.begin() + end);
 
                     s3gen_synthesize_opts copts = opts;
-                    char kbuf[16]; std::snprintf(kbuf, sizeof(kbuf), "%02d", k);
-                    copts.out_wav_path              = base_noext + "_chunk_" + kbuf + ".wav";
+                    std::vector<float> chunk_pcm;
+                    copts.out_wav_path              = "";              // no per-chunk file on disk
+                    copts.pcm_out                   = &chunk_pcm;      // return PCM in-memory
                     copts.append_lookahead_silence  = false;
                     copts.finalize                  = is_last;
                     copts.skip_mel_frames           = prev_mels_emitted;
@@ -1628,25 +1626,8 @@ int main(int argc, char ** argv) {
                     if (first_chunk_t_ms < 0.0)
                         first_chunk_t_ms = 1e-3 * ggml_time_us() - stream_t0_ms;
 
-                    // Read back the per-chunk wav (16-bit PCM @ 24 kHz)
-                    // produced by s3gen_synthesize_to_wav.  In stdout mode
-                    // we also pipe the samples straight to stdout as raw
-                    // s16le and delete the temp file so nothing is left
-                    // behind; in file-output mode we keep the chunk wavs
-                    // next to --out and concatenate at the end.
-                    std::vector<float> chunk_pcm;
-                    {
-                        std::ifstream wf(copts.out_wav_path, std::ios::binary);
-                        if (wf) {
-                            char hdr[44]; wf.read(hdr, 44);
-                            int16_t s16;
-                            while (wf.read((char*)&s16, 2))
-                                chunk_pcm.push_back((float)s16 / 32768.0f);
-                        }
-                    }
                     if (to_stdout) {
                         stream_emit_pcm_stdout(chunk_pcm);
-                        std::remove(copts.out_wav_path.c_str());
                     }
                     streamed_wav.insert(streamed_wav.end(), chunk_pcm.begin(), chunk_pcm.end());
                     hift_cache_source = std::move(tail_out);

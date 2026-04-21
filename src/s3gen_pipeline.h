@@ -12,7 +12,17 @@
 
 struct s3gen_synthesize_opts {
     std::string s3gen_gguf_path;  // required: chatterbox-s3gen.gguf
-    std::string out_wav_path;     // required: where to write the 24 kHz wav
+
+    // Where to write the 24 kHz wav.  Required unless `pcm_out` is set, in
+    // which case an empty string means "do not write any file" (streaming
+    // drivers set this to avoid littering the filesystem with per-chunk
+    // wavs they'd just read back in-memory).
+    std::string out_wav_path;
+
+    // Optional: if non-null, the pipeline writes the 24 kHz float32 mono PCM
+    // samples here in addition to (or instead of) `out_wav_path`.  Lets
+    // callers consume the audio without a temp-file round-trip.
+    std::vector<float> * pcm_out = nullptr;
 
     // If empty, use the built-in voice embedded in the GGUF
     // (s3gen/builtin/{embedding,prompt_token,prompt_feat}).
