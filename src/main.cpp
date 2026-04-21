@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <map>
 #include <random>
 #include <set>
@@ -1733,7 +1734,36 @@ int main(int argc, char ** argv) {
         }
         std::vector<bool> seg_t3_done(N_SEG, false);
         if (!params.output.empty()) seg_t3_done[0] = true;
-        auto ensure_t3 = [&](size_t si) { if (!seg_t3_done[si]) { run_t3_for_segment(si); seg_t3_done[si] = true; } };
+
+        // Background prefetch slot for the *next* segment's T3, used by the
+        // streaming path to hide T3 cost behind the previous segment's
+        // streaming audio.  Only one prefetch is in flight at a time because
+        // run_t3_for_segment mutates the shared allocr / rng / KV cache.
+        std::future<void> next_t3_future;
+        size_t next_t3_segment = (size_t)-1;
+
+        auto ensure_t3 = [&](size_t si) {
+            if (seg_t3_done[si]) return;
+            if (next_t3_segment == si && next_t3_future.valid()) {
+                next_t3_future.get();   // propagates exceptions from the worker
+                seg_t3_done[si] = true;
+                next_t3_segment = (size_t)-1;
+                return;
+            }
+            run_t3_for_segment(si);
+            seg_t3_done[si] = true;
+        };
+
+        // Kick off T3 for segment `si` on a worker thread so it overlaps
+        // with the caller's ongoing S3Gen streaming.  Caller must ensure
+        // no previous prefetch is still in flight.
+        auto prefetch_t3 = [&](size_t si) {
+            if (si >= N_SEG || seg_t3_done[si] || next_t3_segment == si) return;
+            next_t3_segment = si;
+            next_t3_future = std::async(std::launch::async, [&, si]() {
+                run_t3_for_segment(si);
+            });
+        };
 
         // If --s3gen-gguf is set, chain into the S3Gen + HiFT vocoder to write a wav.
         if (!params.s3gen_gguf.empty()) {
@@ -1857,9 +1887,15 @@ int main(int argc, char ** argv) {
                     seg_toks.push_back(S3GEN_SIL);
                     const int total_n = (int)seg_toks.size();
 
-                    // Chunk boundaries within this segment.
+                    // Chunk boundaries within this segment.  The small
+                    // `first_chunk_n` override only applies to the very first
+                    // segment — there it buys low first-audio-out latency.
+                    // For later segments the player already has audio queued,
+                    // so we use the bigger `chunk_n` for all chunks to keep
+                    // per-chunk RTF < 1.0 and avoid a per-segment stutter.
+                    const int seg_first = (si == 0) ? first_chunk_n : chunk_n;
                     std::vector<int> boundaries = {0};
-                    int cursor = std::min(first_chunk_n, total_n);
+                    int cursor = std::min(seg_first, total_n);
                     boundaries.push_back(cursor);
                     while (cursor < total_n) {
                         cursor = std::min(cursor + chunk_n, total_n);
@@ -1917,9 +1953,32 @@ int main(int argc, char ** argv) {
                         size_t chunk_samples = seg_streamed_wav.size() - last_streamed;
                         prev_mels_emitted  += (int)(chunk_samples / 480);
                         last_streamed = seg_streamed_wav.size();
+
+                        // Kick off T3 for the NEXT segment as soon as the
+                        // first chunk of the current segment has been emitted.
+                        // This hides the ~1–2 s T3 cost behind the remaining
+                        // S3Gen chunks so the player doesn't stall waiting
+                        // for the next segment's tokens at the boundary.
+                        // First chunk runs on a "clean" GPU so its RTF stays
+                        // low; subsequent chunks share the GPU with T3 but
+                        // the queue grown by chunk 1 absorbs the slowdown.
+                        if (k == 1 && si + 1 < N_SEG) prefetch_t3(si + 1);
                     }
 
-                    if (!to_stdout) {
+                    if (to_stdout) {
+                        // In stdout mode, emit a short inter-segment silence
+                        // (unless this is the final segment) so the player's
+                        // buffer stays non-empty while T3 decodes the next
+                        // segment (~1.5 s with no PCM otherwise).  The
+                        // silence reads as a natural sentence-break pause.
+                        const bool more = (si + 1 < N_SEG);
+                        if (more && params.crossfade_ms > 0) {
+                            const int gap_ms = std::max(150, 2 * params.crossfade_ms);
+                            const int gap_samples = sr * gap_ms / 1000;
+                            std::vector<float> gap(gap_samples, 0.0f);
+                            stream_emit_pcm_stdout(gap);
+                        }
+                    } else {
                         // File mode: concatenate segments with a raised-cosine
                         // crossfade at each boundary, identical to the
                         // non-streaming auto-split path.
