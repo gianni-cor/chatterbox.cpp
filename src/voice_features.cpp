@@ -126,8 +126,8 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
 // Reflect-pad along the time axis.  For p_left / p_right > 0, a length-L signal
 // becomes length (L + p_left + p_right) via PyTorch's "reflect" semantics, i.e.
 // mirror without repeating the boundary sample.
-static void reflect_pad_1d(const std::vector<float> & in, int p_left, int p_right,
-                           std::vector<float> & out)
+void reflect_pad_1d(const std::vector<float> & in, int p_left, int p_right,
+                    std::vector<float> & out)
 {
     const int L = (int)in.size();
     out.resize((size_t)(L + p_left + p_right));
@@ -235,15 +235,24 @@ static std::vector<float> mel_extract_generic(
     return out;
 }
 
+// Forward declarations (defined in mel_extract_stft.cpp, which pushes the
+// STFT + mel matmul onto a ggml-cpu graph — NEON on Apple Silicon, AVX on x86).
+std::vector<float> mel_extract_stft_hann_ggml(
+    const std::vector<float> & wav,
+    const std::vector<float> & mel_fb,
+    int n_fft, int hop, int win, int n_mels,
+    int center_mode, float power_exp, float log_floor);
+std::vector<float> fbank_kaldi_80_ggml(const std::vector<float> & wav_16k,
+                                       const std::vector<float> & mel_fb);
+
 std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
                                       const std::vector<float> & mel_filterbank)
 {
     // center=False, magnitude (power_exp=1), log-compress with 1e-5 floor,
     // transpose to (T, 80).
-    return mel_extract_generic(wav_24k, mel_filterbank,
+    return mel_extract_stft_hann_ggml(wav_24k, mel_filterbank,
         /*n_fft=*/1920, /*hop=*/480, /*win=*/1920, /*n_mels=*/80,
-        /*center=*/0, /*power_exp=*/1.0f, /*log_floor=*/1e-5f,
-        /*transpose=*/true);
+        /*center=*/0, /*power_exp=*/1.0f, /*log_floor=*/1e-5f);
 }
 
 // =============================================================================
@@ -377,10 +386,9 @@ std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
 {
     // center=True (librosa stft default), POWER spectrogram (mel_power=2.0),
     // NO log (mel_type='amp', normalized_mels=False), transpose to (T, 40).
-    return mel_extract_generic(wav_16k, mel_filterbank,
+    return mel_extract_stft_hann_ggml(wav_16k, mel_filterbank,
         /*n_fft=*/400, /*hop=*/160, /*win=*/400, /*n_mels=*/40,
-        /*center=*/1, /*power_exp=*/2.0f, /*log_floor=*/-1.0f,
-        /*transpose=*/true);
+        /*center=*/1, /*power_exp=*/2.0f, /*log_floor=*/-1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +396,17 @@ std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
 // ---------------------------------------------------------------------------
 std::vector<float> fbank_kaldi_80(const std::vector<float> & wav_16k,
                                   const std::vector<float> & mel_filterbank)
+{
+    // Route to the ggml-backed implementation: identical numerics, just
+    // replaces the scalar DFT inner loop with a batched matmul.
+    return fbank_kaldi_80_ggml(wav_16k, mel_filterbank);
+}
+
+// Scalar reference implementation — kept only as a dead-code correctness
+// reference and for easy comparison if we need to debug the ggml path.
+#if 0
+static std::vector<float> fbank_kaldi_80_scalar(const std::vector<float> & wav_16k,
+                                                const std::vector<float> & mel_filterbank)
 {
     const int n_fft      = 512;           // next_pow2(frame_length)
     const int frame_len  = 400;           // 25 ms @ 16 kHz
@@ -485,3 +504,4 @@ std::vector<float> fbank_kaldi_80(const std::vector<float> & wav_16k,
 
     return out;
 }
+#endif

@@ -87,33 +87,35 @@ struct model_ctx {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
-static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
+static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
 #ifdef GGML_USE_CUDA
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_cuda_init(0);
-        if (b) { fprintf(stderr, "s3gen: using CUDA backend\n"); return b; }
+        if (b) { if (verbose) fprintf(stderr, "s3gen: using CUDA backend\n"); return b; }
     }
 #endif
 #ifdef GGML_USE_METAL
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_metal_init();
-        if (b) { fprintf(stderr, "s3gen: using Metal backend\n"); return b; }
+        if (b) { if (verbose) fprintf(stderr, "s3gen: using Metal backend\n"); return b; }
     }
 #endif
 #ifdef GGML_USE_VULKAN
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_vk_init(0);
         if (b) {
-            char desc[256] = {0};
-            ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-            fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
+            if (verbose) {
+                char desc[256] = {0};
+                ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+                fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
+            }
             return b;
         }
     }
 #endif
     auto * b = ggml_backend_cpu_init();
     if (!b) throw std::runtime_error("ggml_backend_cpu_init() failed");
-    fprintf(stderr, "s3gen: using CPU backend\n");
+    if (verbose) fprintf(stderr, "s3gen: using CPU backend\n");
     return b;
 }
 
@@ -125,7 +127,7 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
 // stays alive for the lifetime of the process (we never evict), which
 // matches the streaming CLI's single-voice use case.  A proper LRU would
 // belong in a server front-end.
-static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers);
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose);
 
 namespace {
 struct s3gen_cache_entry { std::string path; int gpu = 0; std::unique_ptr<model_ctx> m; };
@@ -153,21 +155,23 @@ static void s3gen_model_cache_release() {
     g_s3gen_cache_entry.reset();
 }
 
-static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_layers) {
+static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_layers, bool verbose) {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (g_s3gen_cache_entry &&
         g_s3gen_cache_entry->path == path &&
         g_s3gen_cache_entry->gpu  == n_gpu_layers) {
-        fprintf(stderr, "  %zu tensors (cached — skip GGUF load)\n",
-                g_s3gen_cache_entry->m->tensors.size());
+        if (verbose) {
+            fprintf(stderr, "  %zu tensors (cached — skip GGUF load)\n",
+                    g_s3gen_cache_entry->m->tensors.size());
+        }
         g_s3gen_cache_last_load_ms = 0.0;
         return g_s3gen_cache_entry->m.get();
     }
-    fprintf(stderr, "Loading %s\n", path.c_str());
+    if (verbose) fprintf(stderr, "Loading %s\n", path.c_str());
     double t0 = now_ms();
-    auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers));
+    auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers, verbose));
     g_s3gen_cache_last_load_ms = now_ms() - t0;
-    fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m->tensors.size(), g_s3gen_cache_last_load_ms);
+    if (verbose) fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m->tensors.size(), g_s3gen_cache_last_load_ms);
     g_s3gen_cache_entry = std::make_unique<s3gen_cache_entry>(
         s3gen_cache_entry{path, n_gpu_layers, std::move(m)});
 
@@ -185,13 +189,13 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
 
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 
-static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers) {
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
-    m.backend = s3gen_init_backend(n_gpu_layers);
+    m.backend = s3gen_init_backend(n_gpu_layers, verbose);
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
@@ -833,6 +837,19 @@ static std::vector<float> cfm_estimator_forward(
     ggml_gallocr_reserve(cache.allocr, gf);
     }  // end graph-build block
 
+    // Tried: run one dummy compute right after gallocr_reserve to pre-warm
+    // Vulkan's first-dispatch state (shader residency / memory pool / command
+    // pool warmup), hoping the real step0 would then run at step1 speed
+    // (~12 ms instead of ~83 ms).  Outcome: the cold-compute cost is
+    // per-dispatch, not per-graph-first-dispatch — adding the warmup just
+    // shifted 70 ms from "hidden first-dispatch" to "explicit extra compute"
+    // without reducing step0.  S3GEN_INFER went UP by ~13 ms.  Reverted.
+    // The 83→12 ms gap appears to be a driver/scheduler warm-up cost on the
+    // first command buffer submission that no amount of dummy work inside
+    // cfm_estimator_forward removes.  Real fix would need to move the first
+    // dispatch elsewhere in the pipeline (e.g. during T3→S3Gen transition)
+    // so it overlaps with other host work, which is a bigger refactor.
+
 compute_only:
     ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
@@ -1257,12 +1274,20 @@ int s3gen_synthesize_to_wav(
     const int  seed       = opts.seed;
     const int  sr         = opts.sr;
     const bool debug_mode = opts.debug;
+    const bool verbose    = opts.verbose;
     const int  pre_lookahead_len = 3;  // Chatterbox default
+
+    // Verbose progress / per-stage timing goes through this helper so all of
+    // it can be disabled with `--verbose` unset.  Errors and machine-parseable
+    // BENCH: lines stay unconditional below.
+    auto vlog = [&](const char * fmt, auto... args) {
+        if (verbose) fprintf(stderr, fmt, args...);
+    };
 
     int n_threads = opts.n_threads;
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     g_n_threads = n_threads;
-    fprintf(stderr, "Using %d threads\n", g_n_threads);
+    vlog("Using %d threads\n", g_n_threads);
     if (gguf_path.empty() || out_path.empty()) {
         fprintf(stderr, "s3gen_synthesize_to_wav: s3gen_gguf_path and out_wav_path are required\n");
         return 1;
@@ -1286,13 +1311,13 @@ int s3gen_synthesize_to_wav(
 
     if (ref_dir.empty() && opts.embedding_override.empty() && opts.prompt_feat_override.empty()
         && opts.prompt_token_override.empty()) {
-        fprintf(stderr, "No --ref-dir given; loading built-in voice from GGUF.\n");
+        vlog("No --ref-dir given; loading built-in voice from GGUF.\n");
     } else {
-        if (!ref_dir.empty()) fprintf(stderr, "Loading ref dict from %s\n", ref_dir.c_str());
+        if (!ref_dir.empty()) vlog("Loading ref dict from %s\n", ref_dir.c_str());
 
         if (!opts.prompt_token_override.empty()) {
             pt_data = opts.prompt_token_override;
-            fprintf(stderr, "  prompt_token: using C++ override (S3TokenizerV2, %zu tokens)\n",
+            vlog("  prompt_token: using C++ override (S3TokenizerV2, %zu tokens)\n",
                     pt_data.size());
         } else {
             npy_array pt_npy = npy_load(ref_dir + "/prompt_token.npy");
@@ -1302,7 +1327,7 @@ int s3gen_synthesize_to_wav(
 
         if (!opts.embedding_override.empty()) {
             emb_data = opts.embedding_override;
-            fprintf(stderr, "  embedding: using C++ override (CAMPPlus, %zu dims)\n", emb_data.size());
+            vlog("  embedding: using C++ override (CAMPPlus, %zu dims)\n", emb_data.size());
         } else {
             npy_array emb_npy = npy_load(ref_dir + "/embedding.npy");
             emb_data.assign((const float*)emb_npy.data.data(),
@@ -1312,7 +1337,7 @@ int s3gen_synthesize_to_wav(
         if (!opts.prompt_feat_override.empty()) {
             pf_data = opts.prompt_feat_override;
             pf_rows = opts.prompt_feat_rows_override;
-            fprintf(stderr, "  prompt_feat: using C++ override (%d mel frames)\n", pf_rows);
+            vlog("  prompt_feat: using C++ override (%d mel frames)\n", pf_rows);
         } else {
             npy_array pf_npy = npy_load(ref_dir + "/prompt_feat.npy");
             pf_data.assign((const float*)pf_npy.data.data(),
@@ -1321,7 +1346,7 @@ int s3gen_synthesize_to_wav(
         }
     }
 
-    fprintf(stderr, "Speech tokens: %zu\n", speech_tokens.size());
+    vlog("Speech tokens: %zu\n", speech_tokens.size());
 
     // Trim tokens >= vocab_size.  In batch / last-chunk (`finalize=true`) we
     // append 3 S3GEN_SIL lookahead tokens to give the encoder right-context
@@ -1341,8 +1366,9 @@ int s3gen_synthesize_to_wav(
 
     // Cache the loaded model across invocations so the streaming driver
     // pays the ~700 ms GGUF-load cost only once.  Keyed on (path,
-    // n_gpu_layers) so switching backends still works.
-    model_ctx & m = *s3gen_model_cache_get(gguf_path, opts.n_gpu_layers);
+    // n_gpu_layers) so switching backends still works.  Verbose gates the
+    // banner prints but the BENCH line always goes out for perf checks.
+    model_ctx & m = *s3gen_model_cache_get(gguf_path, opts.n_gpu_layers, verbose);
     fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", s3gen_model_cache_last_load_ms());
 
     // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
@@ -1370,7 +1396,7 @@ int s3gen_synthesize_to_wav(
         ggml_backend_tensor_get(t_pf,  pf_data.data(),  0, ggml_nbytes(t_pf));
         // prompt_feat is stored ggml ne=[80, 500] = numpy (500, 80).
         pf_rows = (int)t_pf->ne[1];
-        fprintf(stderr, "  built-in voice: embedding=(%zu,) prompt_token=(%zu,) prompt_feat=(%d, %lld)\n",
+        vlog("  built-in voice: embedding=(%zu,) prompt_token=(%zu,) prompt_feat=(%d, %lld)\n",
                 emb_data.size(), pt_data.size(), pf_rows, (long long)t_pf->ne[0]);
     }
     double pipeline_t0 = now_ms();
@@ -1381,18 +1407,18 @@ int s3gen_synthesize_to_wav(
     // 1) Concat prompt_token + padded speech_tokens
     int n_prompt = (int)pt_data.size();
     int n_total = n_prompt + (int)padded.size();
-    fprintf(stderr, "n_prompt=%d n_speech_padded=%zu n_total=%d\n", n_prompt, padded.size(), n_total);
+    vlog("n_prompt=%d n_speech_padded=%zu n_total=%d\n", n_prompt, padded.size(), n_total);
 
     std::vector<int32_t> flow_tokens(n_total);
     std::memcpy(flow_tokens.data(), pt_data.data(), n_prompt * sizeof(int32_t));
     std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
 
     // 2) input_embedding lookup + multiply by mask
-    fprintf(stderr, "Running input_embedding...\n");
+    vlog("Running input_embedding...\n");
     ggml_tensor * emb_w = find_tensor(m, "flow/input_embedding");
     std::vector<float> emb_w_data(ggml_nelements(emb_w));
     ggml_backend_tensor_get(emb_w, emb_w_data.data(), 0, ggml_nbytes(emb_w));
-    fprintf(stderr, "  emb_w ne=[%lld, %lld]\n", (long long)emb_w->ne[0], (long long)emb_w->ne[1]);
+    vlog("  emb_w ne=[%lld, %lld]\n", (long long)emb_w->ne[0], (long long)emb_w->ne[1]);
     int vocab_size = (int)emb_w->ne[1];
     std::vector<float> input_embed(n_total * D);
     for (int i = 0; i < n_total; ++i) {
@@ -1411,12 +1437,12 @@ int s3gen_synthesize_to_wav(
     }
 
     // 3) Run encoder -> mu_T (numpy (T_mu, 80) layout, to match encoder_proj.npy)
-    fprintf(stderr, "Running encoder (T=%d)...\n", n_total);
+    vlog("Running encoder (T=%d)...\n", n_total);
     double encoder_t0 = now_ms();
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
     fprintf(stderr, "  [encoder] %.1f ms\n", now_ms() - encoder_t0);
     int T_mu = 2 * n_total;
-    fprintf(stderr, "  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
+    vlog("  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
 
     // Streaming: trim the last `pre_lookahead_len * token_mel_ratio = 6`
     // frames off the encoder output BEFORE CFM (matches Python's
@@ -1479,7 +1505,7 @@ int s3gen_synthesize_to_wav(
     }
 
     // 4) Speaker embedding: F.normalize + spk_embed_affine_layer
-    fprintf(stderr, "Computing speaker embedding...\n");
+    vlog("Computing speaker embedding...\n");
     const float * emb_raw = emb_data.data();
     float norm = 0.0f;
     for (int i = 0; i < 192; ++i) norm += emb_raw[i] * emb_raw[i];
@@ -1554,11 +1580,11 @@ int s3gen_synthesize_to_wav(
     }
 
     // 6) For meanflow: z = randn(80, T_mu); then z[:, prompt_len:] = noised_mels (randn(80, T_speech*2))
-    fprintf(stderr, "Initializing CFM noise (seed=%d, meanflow)...\n", seed);
+    vlog("Initializing CFM noise (seed=%d, meanflow)...\n", seed);
     std::vector<float> z(T_mu * MEL);
     int n_speech_part = 2 * (int)padded.size();
     int prompt_len_in_mu = T_mu - n_speech_part;
-    fprintf(stderr, "  T_mu=%d prompt_len_in_mu=%d n_speech_part=%d\n",
+    vlog("  T_mu=%d prompt_len_in_mu=%d n_speech_part=%d\n",
             T_mu, prompt_len_in_mu, n_speech_part);
     if (!opts.cfm_z0_override.empty()) {
         // Streaming validation path: use the exact noise Python used for
@@ -1614,7 +1640,7 @@ int s3gen_synthesize_to_wav(
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
         float t = t_span[s], r = t_span[s + 1];
         float dt = r - t;
-        fprintf(stderr, "CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
+        vlog("CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
         auto t_mlp = compute_time_mlp(m, t);
         auto r_mlp = compute_time_mlp(m, r);
         auto t_emb = compute_time_mixed(m, t_mlp, r_mlp);
@@ -1682,7 +1708,7 @@ int s3gen_synthesize_to_wav(
         return 1;
     }
     int T_mel = T_mel_full - skip;
-    fprintf(stderr, "Mel slicing: T_mu=%d mel_len1=%d full=%d skip=%d -> T_mel=%d  "
+    vlog("Mel slicing: T_mu=%d mel_len1=%d full=%d skip=%d -> T_mel=%d  "
                     "(finalize=%s, pad_silence=%s)\n",
             T_mu, mel_len1, T_mel_full, skip, T_mel,
             opts.finalize ? "true" : "false",
@@ -1720,7 +1746,7 @@ int s3gen_synthesize_to_wav(
 
     // 9) HiFT
     double hift_t0 = now_ms();
-    fprintf(stderr, "Running f0_predictor...\n");
+    vlog("Running f0_predictor...\n");
     double t0 = now_ms();
     auto f0 = run_f0_predictor(m_hift, mel, T_mel);
     fprintf(stderr, "  [f0_predictor] %.1f ms\n", now_ms() - t0);
@@ -1730,7 +1756,7 @@ int s3gen_synthesize_to_wav(
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
 
-    fprintf(stderr, "Running SineGen...\n");
+    vlog("Running SineGen...\n");
     t0 = now_ms();
     std::vector<float> l_linear_w(9);
     ggml_tensor * llw = find_tensor(m_hift, "hift/m_source/l_linear/weight");
@@ -1748,7 +1774,7 @@ int s3gen_synthesize_to_wav(
     if (!opts.hift_cache_source.empty()) {
         size_t n = std::min(opts.hift_cache_source.size(), src.size());
         std::memcpy(src.data(), opts.hift_cache_source.data(), n * sizeof(float));
-        fprintf(stderr, "  [sinegen] spliced %zu cache_source samples at head\n", n);
+        vlog("  [sinegen] spliced %zu cache_source samples at head\n", n);
     }
     // Export the tail for the next chunk's cache_source BEFORE running STFT
     // (Python returns `s` unmodified; our tail copy matches that convention).
@@ -1757,18 +1783,18 @@ int s3gen_synthesize_to_wav(
         opts.hift_source_tail_out->assign(src.end() - tail_n, src.end());
     }
 
-    fprintf(stderr, "Running STFT...\n");
+    vlog("Running STFT...\n");
     t0 = now_ms();
     auto s_stft = run_stft(m_hift, src);
     fprintf(stderr, "  [stft] %.1f ms\n", now_ms() - t0);
     int T_stft = (int)(s_stft.size() / 18);
 
-    fprintf(stderr, "Running HiFT decode...\n");
+    vlog("Running HiFT decode...\n");
     t0 = now_ms();
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft);
     fprintf(stderr, "  [hift_decode] %.1f ms\n", now_ms() - t0);
     fprintf(stderr, "  [hift_total] %.1f ms\n", now_ms() - hift_t0);
-    fprintf(stderr, "  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
+    vlog("  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
 
     // First-chunk / batch-mode: apply raised-cosine fade-in to mask HiFT's
     // resnet cold start.  Length = 2*(sr/50) = 960 samples (40 ms) at 24 kHz.

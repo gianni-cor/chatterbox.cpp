@@ -43,6 +43,7 @@ struct s3gen_synthesize_opts {
     int  n_threads = 0;          // 0 = hardware_concurrency
     int  sr        = 24000;
     bool debug     = false;      // validation mode; requires ref_dir
+    bool verbose   = false;      // print per-stage wall times to stderr
 
     // When > 0, try to run S3Gen + HiFT on a GPU backend (CUDA / Metal / Vulkan
     // depending on what the build enables).  Falls back to CPU if the backend

@@ -13,6 +13,7 @@
 
 struct ggml_context;
 struct ggml_tensor;
+typedef struct ggml_backend * ggml_backend_t;
 
 // Weights for a single LSTM layer, PyTorch convention:
 //   w_ih: (4*H, I) float32,  gates stacked as [i, f, g, o]
@@ -53,6 +54,10 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
 // Run the whole embedding pipeline on a reference waveform.
 //
 //   wav_16k        : mono, 16 kHz, float32 in [-1, 1]
+//   backend        : main ggml backend (Metal / Vulkan / CUDA / CPU).  The
+//                    3-layer LSTM + final linear projection run as a single
+//                    unrolled ggml graph per partial window on this backend.
+//                    Pass nullptr to fall back on an internal CPU backend.
 //   out            : 256-d L2-normalised speaker embedding
 //
 // Internally: compute 40-ch power mel → split into overlapping 160-frame
@@ -61,4 +66,5 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
 // VoiceEncoder.embeds_from_wavs(..., as_spk=False) for a single utterance.
 bool voice_encoder_embed(const std::vector<float> & wav_16k,
                          const voice_encoder_weights & w,
+                         ggml_backend_t backend,
                          std::vector<float> & out);

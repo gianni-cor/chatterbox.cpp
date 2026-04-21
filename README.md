@@ -5,18 +5,23 @@ ported to [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference
 on CPU / Metal / CUDA / Vulkan, with no runtime dependency on Python or
 PyTorch.
 
-Speed on a 10 s sentence (end-to-end, both T3 and S3Gen+HiFT):
+End-to-end inference on a short sentence with voice cloning from an 11 s
+reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
 
-| Backend                     | `gen_RTF` | Wall   | vs real-time |
-|-----------------------------|----------:|-------:|-------------:|
-| CPU (10-core EPYC, F16)     | 0.70      | 8.2 s  | 1.4×         |
-| Metal (M3 Ultra, Q4_0)      | 0.14      | 2.0 s  | 7.3×         |
-| Vulkan (RTX 5090, Q4_0)     | 0.06      | < 1 s  | 17.1×        |
+| Backend                              | Wall      | `RTF`  | vs real-time | vs ONNX Runtime |
+|--------------------------------------|----------:|-------:|-------------:|----------------:|
+| Vulkan (RTX 5090, Q4_0)              |   463 ms  | 0.07   | **14.2×**    | **13.8× faster** |
+| Metal (Mac Studio M3 Ultra, Q4_0)    |   985 ms  | 0.16   | 6.4×         | 17.5× faster    |
+| CPU (AMD Ryzen 9 9950X, AVX, Q4_0)   | 5 397 ms  | 0.82   | 1.2×         | 1.2× faster     |
+| CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        | 2.3× faster     |
+| Reference (qvac-onnx-tts, CPU Q4)    | 6.4–17 s  | 1.2–3.2 | 0.3–0.85×   | —               |
 
-See [`PROGRESS.md`](PROGRESS.md) for the full chronological development
-journal, including numerical-parity stages and every optimization pass
-that got us here (T3 Flash Attention, KV-cache layout rework, Metal
-kernel patches, legacy Q4/Q5/Q8 quantization, etc.).
+See the [full benchmark](#performance) section below for the per-stage
+breakdown, or [`PROGRESS.md`](PROGRESS.md) for the full chronological
+development journal — every numerical-parity stage and optimization pass
+(T3 Flash Attention, KV-cache layout rework, Metal kernel patches,
+CAMPPlus + VoiceEncoder + S3TokenizerV2 ported to ggml graphs, mel
+extraction via STFT matmul, legacy Q4/Q5/Q8 quantization, etc.).
 
 ---
 
@@ -263,25 +268,89 @@ ffplay /tmp/out.wav         # any OS with ffmpeg
   values for the random bits so every stage can be bit-exactly compared
   to PyTorch.
 
-Typical end-to-end timings on a 10 s sentence
-(`gen_RTF = (T3_INFER_MS + S3GEN_INFER_MS) / AUDIO_MS`):
+<a id="performance"></a>
+## Performance
 
-| Backend (weights)           | T3 gen  | S3Gen+HiFT gen | `gen_RTF` | Wall  | vs real-time |
-|-----------------------------|--------:|---------------:|----------:|------:|-------------:|
-| CPU (10-core EPYC, F16)     | 3998 ms | 2905 ms        | 0.70      | 8.2 s | 1.4×         |
-| Metal (M3 Ultra, F16)       |  909 ms |  562 ms        | 0.15      | 2.1 s | 6.7×         |
-| Metal (M3 Ultra, Q4_0)      |  886 ms |  608 ms        | 0.14      | 2.0 s | 7.3×         |
-| Vulkan (RTX 5090, F16)      |  402 ms |  282 ms        | 0.06      | < 1 s | 15.6×        |
-| Vulkan (RTX 5090, Q4_0)     |  347 ms |  284 ms        | 0.06      | < 1 s | 17.1×        |
+Reproducible perf check vs the `@qvac/tts-onnx` package (ONNX Runtime
+Q4 quantization, same architecture) on the same machine.  Shared setup:
 
-`Wall` includes GGUF load time; `gen_RTF` is inference only.  Full
-breakdown with CFM / HiFT sub-timings plus an ONNX baseline is in
+- Text: *"Hello from native C plus plus. This audio was generated end
+  to end on CPU using ggml."*
+- Reference voice: `test/reference-audio/jfk.wav` (11 s mono 16 kHz)
+- Seed: 42, warm 3-run average, inference only (excludes model load)
+
+### Mac Studio M3 Ultra (96 GB unified memory)
+
+| Implementation                        | Backend         | T3 gen             | S3Gen+HiFT gen | Total inference | RTF   | vs real-time |
+|---------------------------------------|-----------------|-------------------:|---------------:|----------------:|------:|-------------:|
+| **`chatterbox.cpp` Q4_0**             | **Metal**       |  573 ms / 155 tok  |    412 ms      |   **985 ms**    | 0.16  | **6.4×**     |
+| `chatterbox.cpp` Q4_0                 | CPU (NEON+Accel)| 2 045 ms / 178 tok |  5 523 ms      |    7 568 ms     | 1.05  | 0.96×        |
+| `@qvac/tts-onnx` Q4 (ONNX Runtime)    | CPU             |        —           |      —         |   17 190 ms     | 3.18  | 0.31×        |
+
+`chatterbox.cpp` (Metal) is **17.5× faster than ONNX Runtime** on the
+same machine; the CPU-only build is still 2.3× faster.
+
+### Linux RTX 5090 + AMD Ryzen 9 9950X
+
+| Implementation                        | Backend         | T3 gen             | S3Gen+HiFT gen | Total inference | RTF   | vs real-time |
+|---------------------------------------|-----------------|-------------------:|---------------:|----------------:|------:|-------------:|
+| **`chatterbox.cpp` Q4_0**             | **Vulkan**      |  241 ms / 161 tok  |    222 ms      |    **463 ms**   | 0.07  | **14.2×**    |
+| `chatterbox.cpp` Q4_0                 | CPU (AVX)       | 2 161 ms / 161 tok |  3 236 ms      |    5 397 ms     | 0.82  | 1.2×         |
+| `@qvac/tts-onnx` Q4 (ONNX Runtime)    | CPU             |        —           |      —         |    6 373 ms     | 1.18  | 0.85×        |
+
+`chatterbox.cpp` (Vulkan) is **13.8× faster than ONNX Runtime** on the
+same machine.  Note that the `@qvac/tts-onnx` package only ships the
+CPU execution provider; a CUDA build would narrow the gap, but is not
+available in the published addon today.
+
+### Per-stage S3Gen + HiFT breakdown (GPU builds)
+
+| Stage           | M3 Ultra Metal  | RTX 5090 Vulkan |
+|-----------------|----------------:|----------------:|
+| T3 per token    | 3.70 ms / tok   | **1.50 ms/tok** |
+| encoder         |    38 ms        |    35 ms        |
+| cfm_step0       |    69 ms        |    84 ms        |
+| cfm_step1       |    49 ms        |    13 ms        |
+| cfm_total       |   124 ms        |   100 ms        |
+| f0_predictor    |   3.1 ms        |   1.1 ms        |
+| sinegen (CPU)   |    15 ms        |    16 ms        |
+| stft            |   3.1 ms        |   1.0 ms        |
+| **hift_decode** |   225 ms        |    66 ms        |
+| hift_total      |   246 ms        |    84 ms        |
+
+HiFT `conv_transpose_1d` upsampling is the single biggest stage on
+Metal today; the 5090 chews through it 3.4× faster, which is where the
+remaining end-to-end gap comes from.
+
+### Reproducing these numbers
+
+```bash
+# Build chatterbox.cpp, then:
+./build/chatterbox \
+    --model       models/chatterbox-t3-turbo.gguf \
+    --s3gen-gguf  models/chatterbox-s3gen.gguf \
+    --reference-audio test/reference-audio/jfk.wav \
+    --text "Hello from native C plus plus. This audio was generated end to end on CPU using ggml." \
+    --out /tmp/bench.wav \
+    --seed 42 \
+    --n-gpu-layers 99   # 0 or omit for CPU
+```
+
+The binary prints both the per-stage timings and `BENCH:` lines that
+scripts can scrape.  Note: the binary also prints an inner
+`=== pipeline: … RTF=… ===` line — that RTF covers **only the
+S3Gen + HiFT phase** (the timer around `s3gen_synthesize_to_wav`, which
+runs after T3 is already done).  The tables above report the full
+end-to-end number (T3_INFER + S3GEN_INFER).
+
+`gen_RTF = (T3_INFER_MS + S3GEN_INFER_MS) / AUDIO_MS`
+
+Token counts vary slightly across backends because the CPU-side
+sampler reads logits that come out of different float-reduction orders
+per backend; per-token T3 cost is the directly-comparable figure.
+Full development history and older backend combinations (F16 vs
+Q4_0 / Q5_0 / Q8_0, plus other machines) are in
 [`PROGRESS.md §3.10 / §3.13`](PROGRESS.md).
-
-Note: the binary also prints an inner `=== pipeline: … RTF=… ===` line
-during synthesis.  That RTF covers **only the S3Gen + HiFT phase**
-(it's the timer around `s3gen_synthesize_to_wav`, which runs after T3
-is already done).  The table above reports the full end-to-end number.
 
 ### Streaming mode — low-latency playback
 

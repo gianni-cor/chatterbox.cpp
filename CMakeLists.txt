@@ -15,6 +15,7 @@ add_executable(chatterbox
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
     src/voice_features.cpp
+    src/mel_extract_stft.cpp
     src/voice_encoder.cpp
     src/campplus.cpp
     src/s3tokenizer.cpp)
@@ -38,20 +39,23 @@ target_include_directories(mel2wav PRIVATE ggml/include src)
 # Voice-cloning preprocessing validation (WAV I/O + resample + 80-ch mel).
 add_executable(test-voice-features
     src/test_voice_features.cpp
-    src/voice_features.cpp)
+    src/voice_features.cpp
+    src/mel_extract_stft.cpp)
 target_link_libraries(test-voice-features PRIVATE ggml)
 target_include_directories(test-voice-features PRIVATE ggml/include src)
 
 add_executable(test-resample
     src/test_resample.cpp
-    src/voice_features.cpp)
+    src/voice_features.cpp
+    src/mel_extract_stft.cpp)
 target_link_libraries(test-resample PRIVATE ggml)
 target_include_directories(test-resample PRIVATE src)
 
 add_executable(test-voice-encoder
     src/test_voice_encoder.cpp
     src/voice_encoder.cpp
-    src/voice_features.cpp)
+    src/voice_features.cpp
+    src/mel_extract_stft.cpp)
 target_link_libraries(test-voice-encoder PRIVATE ggml)
 target_include_directories(test-voice-encoder PRIVATE ggml/include src)
 
@@ -69,7 +73,8 @@ endif()
 # Kaldi-style fbank validation harness.
 add_executable(test-fbank
     src/test_fbank.cpp
-    src/voice_features.cpp)
+    src/voice_features.cpp
+    src/mel_extract_stft.cpp)
 target_link_libraries(test-fbank PRIVATE ggml)
 target_include_directories(test-fbank PRIVATE ggml/include src)
 
@@ -77,7 +82,8 @@ target_include_directories(test-fbank PRIVATE ggml/include src)
 add_executable(test-voice-embedding
     src/test_voice_embedding.cpp
     src/campplus.cpp
-    src/voice_features.cpp)
+    src/voice_features.cpp
+    src/mel_extract_stft.cpp)
 target_link_libraries(test-voice-embedding PRIVATE ggml)
 target_include_directories(test-voice-embedding PRIVATE ggml/include src)
 if (OpenMP_CXX_FOUND)
