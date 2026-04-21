@@ -1624,7 +1624,6 @@ int main(int argc, char ** argv) {
         const bool auto_split_enabled =
             !params.text.empty() &&
             params.max_sentence_chars > 0 &&
-            params.stream_chunk_tokens <= 0 &&
             !params.dump_tokens_only;
 
         std::vector<std::string> text_segments;
@@ -1789,104 +1788,128 @@ int main(int argc, char ** argv) {
                 stream_write_wav(params.out_wav, full_pcm, sr);
                 fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
             } else {
-                // Streaming synthesis: chunk the speech tokens, carry
-                // cache_source across chunks, apply trim_fade only on chunk 0,
-                // and emit per-chunk wavs as they're produced.
+                // Streaming synthesis.  Runs the chunked S3Gen+HiFT loop on
+                // each T3 segment.  Within a segment, `hift_cache_source`
+                // keeps SineGen phase continuous across chunks and
+                // `skip_mel_frames` trims the already-emitted mel tail.  At
+                // segment boundaries both reset: a new utterance starts, the
+                // crossfade (in file mode) or the natural sentence-break
+                // pause (in stdout mode) masks any seam.
+                //
+                // Also: resetting per segment is precisely what keeps per-
+                // chunk cost bounded — encoder and CFM only ever process the
+                // current segment's cumulative mel, which stays small
+                // (~200-300 tokens).  Single-segment streaming on a long
+                // paragraph otherwise scales linearly with total length.
                 //
                 // Mirrors scripts/dump-streaming-reference.py.  Appends 3
-                // S3GEN_SIL tokens ONCE at the end of the full sequence so
-                // each call's `append_lookahead_silence=false` is safe.
+                // S3GEN_SIL tokens at each segment's tail so every chunk's
+                // `append_lookahead_silence=false` is safe.
                 constexpr int S3GEN_SIL = 4299;
-                std::vector<int32_t> full_tokens = seg_generated.front();
-                full_tokens.push_back(S3GEN_SIL);
-                full_tokens.push_back(S3GEN_SIL);
-                full_tokens.push_back(S3GEN_SIL);
 
                 const int chunk_n       = params.stream_chunk_tokens;
                 const int first_chunk_n = params.stream_first_chunk_tokens > 0
                                         ? params.stream_first_chunk_tokens
                                         : chunk_n;
-                const int total_n = (int)full_tokens.size();
-                // Build boundaries.  First chunk may be smaller than the rest
-                // so first-audio-out lands early; subsequent chunks use the
-                // bigger `chunk_n` to keep per-chunk RTF low.
-                std::vector<int> boundaries = {0};
-                int cursor = std::min(first_chunk_n, total_n);
-                boundaries.push_back(cursor);
-                while (cursor < total_n) {
-                    cursor = std::min(cursor + chunk_n, total_n);
-                    boundaries.push_back(cursor);
+                const bool to_stdout    = (params.out_wav == "-");
+                const int  sr           = opts.sr ? opts.sr : 24000;
+
+                if (multi_seg) {
+                    fprintf(stderr, "\n=== streaming synthesis: %zu segments, %d-token chunks%s ===\n",
+                            seg_generated.size(), chunk_n,
+                            to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
+                } else {
+                    fprintf(stderr, "\n=== streaming synthesis: %d-token chunks%s ===\n",
+                            chunk_n,
+                            to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
                 }
 
-                std::vector<float> hift_cache_source;
-                std::vector<float> streamed_wav;
-                int prev_mels_emitted = 0;
-
-                // `--out -` is the live-streaming mode: emit each chunk's
-                // PCM to stdout as it's produced.  Otherwise the chunks are
-                // concatenated in memory and the full wav is written to
-                // `--out` at the end.  Per-chunk wav files are never written
-                // to disk — s3gen_synthesize_to_wav returns the float32 PCM
-                // in-memory via `pcm_out`.
-                const bool to_stdout = (params.out_wav == "-");
-
-                fprintf(stderr, "\n=== streaming synthesis: %d chunks of %d tokens%s ===\n",
-                        (int)boundaries.size() - 1, chunk_n,
-                        to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
+                std::vector<float> full_streamed_wav;   // only used in file mode
                 const double stream_t0_ms = 1e-3 * ggml_time_us();
                 double first_chunk_t_ms = -1.0;
+                int global_chunk_idx = 0;
 
-                for (int k = 1; k < (int)boundaries.size(); ++k) {
-                    const int end    = boundaries[k];
-                    const bool is_last = (end == total_n);
-                    std::vector<int32_t> toks(full_tokens.begin(), full_tokens.begin() + end);
+                for (size_t si = 0; si < seg_generated.size(); ++si) {
+                    std::vector<int32_t> seg_toks = seg_generated[si];
+                    seg_toks.push_back(S3GEN_SIL);
+                    seg_toks.push_back(S3GEN_SIL);
+                    seg_toks.push_back(S3GEN_SIL);
+                    const int total_n = (int)seg_toks.size();
 
-                    s3gen_synthesize_opts copts = opts;
-                    std::vector<float> chunk_pcm;
-                    copts.out_wav_path              = "";              // no per-chunk file on disk
-                    copts.pcm_out                   = &chunk_pcm;      // return PCM in-memory
-                    copts.append_lookahead_silence  = false;
-                    copts.finalize                  = is_last;
-                    copts.skip_mel_frames           = prev_mels_emitted;
-                    copts.apply_trim_fade           = (k == 1);
-                    copts.hift_cache_source         = hift_cache_source;
-                    std::vector<float> tail_out;
-                    copts.hift_source_tail_out      = &tail_out;
-                    copts.source_tail_samples       = 480;
-                    copts.cfm_steps                 = params.stream_cfm_steps;
-
-                    fprintf(stderr, "\n--- chunk %d/%d: tokens_total=%d finalize=%s ---\n",
-                            k, (int)boundaries.size() - 1, end, is_last ? "true" : "false");
-                    int rc = s3gen_synthesize_to_wav(toks, copts);
-                    if (rc != 0) return rc;
-
-                    if (first_chunk_t_ms < 0.0)
-                        first_chunk_t_ms = 1e-3 * ggml_time_us() - stream_t0_ms;
-
-                    if (to_stdout) {
-                        stream_emit_pcm_stdout(chunk_pcm);
+                    // Chunk boundaries within this segment.
+                    std::vector<int> boundaries = {0};
+                    int cursor = std::min(first_chunk_n, total_n);
+                    boundaries.push_back(cursor);
+                    while (cursor < total_n) {
+                        cursor = std::min(cursor + chunk_n, total_n);
+                        boundaries.push_back(cursor);
                     }
-                    streamed_wav.insert(streamed_wav.end(), chunk_pcm.begin(), chunk_pcm.end());
-                    hift_cache_source = std::move(tail_out);
 
-                    // The number of mel frames emitted by this chunk equals
-                    // wav_samples / 480 (HiFT's fixed upsample factor).
-                    // Wav samples this chunk = streamed_wav.size() - prev.
-                    // Use the per-chunk .wav size to advance skip_mel_frames.
-                    static size_t last_streamed = 0;
-                    size_t chunk_samples = streamed_wav.size() - last_streamed;
-                    prev_mels_emitted  += (int)(chunk_samples / 480);
-                    last_streamed = streamed_wav.size();
+                    std::vector<float> hift_cache_source;       // reset per segment
+                    std::vector<float> seg_streamed_wav;
+                    int prev_mels_emitted = 0;
+                    size_t last_streamed = 0;
+
+                    if (multi_seg) {
+                        fprintf(stderr, "\n[segment %zu/%zu: %d tokens → %d chunks]\n",
+                                si + 1, seg_generated.size(), total_n,
+                                (int)boundaries.size() - 1);
+                    }
+
+                    for (int k = 1; k < (int)boundaries.size(); ++k) {
+                        const int end    = boundaries[k];
+                        const bool is_last_in_seg = (end == total_n);
+                        std::vector<int32_t> toks(seg_toks.begin(), seg_toks.begin() + end);
+
+                        s3gen_synthesize_opts copts = opts;
+                        std::vector<float> chunk_pcm;
+                        copts.out_wav_path              = "";
+                        copts.pcm_out                   = &chunk_pcm;
+                        copts.append_lookahead_silence  = false;
+                        copts.finalize                  = is_last_in_seg;
+                        copts.skip_mel_frames           = prev_mels_emitted;
+                        // First chunk of EACH segment gets trim_fade, masking
+                        // HiFT's per-utterance resnet cold start.
+                        copts.apply_trim_fade           = (k == 1);
+                        copts.hift_cache_source         = hift_cache_source;
+                        std::vector<float> tail_out;
+                        copts.hift_source_tail_out      = &tail_out;
+                        copts.source_tail_samples       = 480;
+                        copts.cfm_steps                 = params.stream_cfm_steps;
+
+                        ++global_chunk_idx;
+                        fprintf(stderr, "\n--- %schunk %d/%d: tokens_total=%d finalize=%s ---\n",
+                                multi_seg ? "seg " : "",
+                                k, (int)boundaries.size() - 1, end,
+                                is_last_in_seg ? "true" : "false");
+                        int rc = s3gen_synthesize_to_wav(toks, copts);
+                        if (rc != 0) return rc;
+
+                        if (first_chunk_t_ms < 0.0)
+                            first_chunk_t_ms = 1e-3 * ggml_time_us() - stream_t0_ms;
+
+                        if (to_stdout) stream_emit_pcm_stdout(chunk_pcm);
+                        seg_streamed_wav.insert(seg_streamed_wav.end(),
+                                                chunk_pcm.begin(), chunk_pcm.end());
+                        hift_cache_source = std::move(tail_out);
+
+                        size_t chunk_samples = seg_streamed_wav.size() - last_streamed;
+                        prev_mels_emitted  += (int)(chunk_samples / 480);
+                        last_streamed = seg_streamed_wav.size();
+                    }
+
+                    if (!to_stdout) {
+                        // File mode: concatenate segments with a raised-cosine
+                        // crossfade at each boundary, identical to the
+                        // non-streaming auto-split path.
+                        append_pcm_crossfade(full_streamed_wav, seg_streamed_wav,
+                                             sr, multi_seg ? params.crossfade_ms : 0);
+                    }
                 }
 
-                // Write the concatenated streamed wav to --out (skip in
-                // stdout mode — we already emitted the PCM live).
-                if (!to_stdout)
-                    stream_write_wav(params.out_wav, streamed_wav, 24000);
-                fprintf(stderr, "\n=== streaming done: %zu samples (%.3fs), first-chunk latency=%.1f ms, total=%.1f ms ===\n",
-                        streamed_wav.size(),
-                        (float)streamed_wav.size() / 24000.0f,
-                        first_chunk_t_ms,
+                if (!to_stdout) stream_write_wav(params.out_wav, full_streamed_wav, sr);
+                fprintf(stderr, "\n=== streaming done: %d chunks, first-chunk latency=%.1f ms, total=%.1f ms ===\n",
+                        global_chunk_idx, first_chunk_t_ms,
                         1e-3 * ggml_time_us() - stream_t0_ms);
                 if (to_stdout)
                     fprintf(stderr, "Streamed to stdout (raw s16le @ 24 kHz mono)\n");
