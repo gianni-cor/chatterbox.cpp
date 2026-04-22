@@ -185,18 +185,36 @@ python scripts/requantize-s3gen.py \
 Measured on the QVAC paragraph (M3 Ultra, Metal, streaming mode
 `--stream-chunk-tokens 25 --max-sentence-chars 100`):
 
-| T3 / S3Gen                | total size | first-audio | total wall | cos sim |
+| T3 / S3Gen                | total size | first-audio | total wall | cos sim¹ |
 |---------------------------|-----------:|------------:|-----------:|--------:|
 | F16 / F32 (baseline)      |  1 757 MB  |  1 604 ms   |   28.6 s   |  1.000  |
 | Q8_0 / F32                |  1 476 MB  |  1 451 ms   |   27.2 s   |   —     |
 | F16 / Q8_0                |  1 532 MB  |  1 646 ms   |   28.2 s   |  0.991  |
 | **Q8_0 / Q8_0**           | **1 251 MB** | **1 399 ms** | **26.4 s** | 0.991 |
+| **Q4_0 / Q4_0**           | **1 071 MB** | **1 510 ms** | **26.7 s** | 0.66²  |
+
+¹ Cosine similarity of the final waveform vs the F16/F32 baseline.
+
+² Q4_0 quantization shifts the CFM diffusion ODE's trajectory enough
+  to land on a *different sample* from the same noise seed.  Subjective
+  quality is essentially the same (in-distribution speech, correct
+  phonemes, stable voice); it's just a different legitimate sample
+  rather than a lower-fidelity version of the baseline.
 
 Using both Q8_0 variants cuts **~500 MB off disk**, drops first-audio
 latency **~13 %**, speeds total wall-clock **~8 %**, and produces
 audibly-identical output (cos-sim > 0.99 vs F32 reference waveform).
-Q4_0 roughly halves size again at a small perceptual cost — use it on
-memory-constrained targets (mobile, low-end CPUs).
+Q4_0 trims another ~180 MB on top for roughly the same speed — best
+choice on memory-constrained targets (mobile, low-end CPUs) when you
+don't need per-seed reproducibility against the F32 baseline.
+
+Note: the S3Gen requantize script only compresses the 385 big 2-D
+matmul weights (encoder attention/MLPs + CFM projections + flow FFs).
+The 1 664 other tensors — biases, norms, spectral filterbanks, the
+input-embedding table, the 3-D convolution weights — remain at their
+source dtype to keep numerics clean.  That's why Q4_0 ends up only
+~15 % smaller than Q8_0 rather than 2× smaller; the bulk not covered
+by block quantization dominates.
 
 Pass the quantized GGUFs to `chatterbox` exactly like the defaults:
 
