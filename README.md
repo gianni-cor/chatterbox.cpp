@@ -158,6 +158,56 @@ python scripts/dump-s3gen-reference.py \
   --seed 42 --n-predict 64 --device cpu
 ```
 
+### Optional: quantize the models (smaller + faster)
+
+Both GGUFs can be quantized to `Q8_0` (near-lossless) or `Q4_0` (light
+quality loss, 3× smaller).  T3 supports `--quant` in its converter; the
+S3Gen GGUF is re-quantized with a small standalone tool because
+`llama-quantize` doesn't know the `chatterbox-s3gen` architecture.
+
+```bash
+# T3: quantize at conversion time.  Choose q8_0 / q5_0 / q4_0.
+python scripts/convert-t3-turbo-to-gguf.py \
+  --out models/t3-q8_0.gguf --quant q8_0
+python scripts/convert-t3-turbo-to-gguf.py \
+  --out models/t3-q4_0.gguf --quant q4_0
+
+# S3Gen: re-quantize the already-converted F32 GGUF in place.
+python scripts/requantize-s3gen.py \
+  models/chatterbox-s3gen.gguf \
+  models/chatterbox-s3gen-q8_0.gguf q8_0
+
+python scripts/requantize-s3gen.py \
+  models/chatterbox-s3gen.gguf \
+  models/chatterbox-s3gen-q4_0.gguf q4_0
+```
+
+Measured on the QVAC paragraph (M3 Ultra, Metal, streaming mode
+`--stream-chunk-tokens 25 --max-sentence-chars 100`):
+
+| T3 / S3Gen                | total size | first-audio | total wall | cos sim |
+|---------------------------|-----------:|------------:|-----------:|--------:|
+| F16 / F32 (baseline)      |  1 757 MB  |  1 604 ms   |   28.6 s   |  1.000  |
+| Q8_0 / F32                |  1 476 MB  |  1 451 ms   |   27.2 s   |   —     |
+| F16 / Q8_0                |  1 532 MB  |  1 646 ms   |   28.2 s   |  0.991  |
+| **Q8_0 / Q8_0**           | **1 251 MB** | **1 399 ms** | **26.4 s** | 0.991 |
+
+Using both Q8_0 variants cuts **~500 MB off disk**, drops first-audio
+latency **~13 %**, speeds total wall-clock **~8 %**, and produces
+audibly-identical output (cos-sim > 0.99 vs F32 reference waveform).
+Q4_0 roughly halves size again at a small perceptual cost — use it on
+memory-constrained targets (mobile, low-end CPUs).
+
+Pass the quantized GGUFs to `chatterbox` exactly like the defaults:
+
+```bash
+./build/chatterbox \
+  --model      models/t3-q8_0.gguf \
+  --s3gen-gguf models/chatterbox-s3gen-q8_0.gguf \
+  --text "Hello from the quantized port." \
+  --n-gpu-layers 99 --out out.wav
+```
+
 ## 3. Run — end-to-end text → wav
 
 The easiest way:
