@@ -904,6 +904,221 @@ The ONNX addon is shown as a baseline because it's the current
 in-house reference TTS implementation. Every ggml configuration —
 including CPU F16 on the same host — beats it.
 
+### 3.17  Multilingual (Llama-520M) variant
+
+Everything up to this point in the journal was Chatterbox **Turbo**
+(GPT-2 Medium T3, meanflow 2-step CFM, English BPE).  §3.17 is the port
+of **ChatterboxMultilingualTTS** (23-language Llama-520M T3 + perceiver
+resampler + CFG-enabled standard 10-step CFM).  Variant is auto-detected
+from `chatterbox.variant` GGUF metadata at load time; Turbo stays byte-
+identical to the pre-§3.17 builds.
+
+**What shipped (commit
+[3f0a8dac](https://github.com/gianni-cor/chatterbox.cpp/commit/3f0a8dac)):**
+
+- `scripts/convert-t3-mtl-to-gguf.py` — packs `t3_mtl23ls_v2.safetensors`
+  (30-layer Llama-520M + cond_enc perceiver + emotion_adv + learned pos
+  embs + built-in voice + VE weights) and the raw grapheme tokenizer
+  JSON into a single GGUF with `chatterbox.variant=t3_mtl` and the full
+  Llama-3 RoPE scaling metadata baked in.  `--quant f16|q8_0|q5_0|q4_0`
+  on the big linears.
+- `scripts/convert-s3gen-to-gguf.py` grew a `--variant {turbo,mtl}`
+  flag.  MTL loads `s3gen.pt` (standard CFM, no `time_embed_mixer`) and
+  stamps `s3gen.meanflow=false, cfg_rate=0.7, n_timesteps=10`.  Turbo
+  path unchanged.
+- `src/mtl_tokenizer.{h,cpp}` + `mtl_unicode_tables.inc` — self-
+  contained BPE tokenizer mirroring HuggingFace's BPE loader + the
+  Python preprocess (NFKD + UTF-8 lowercase + `[lang_id]` prefix + Korean
+  Jamo decomposition).  Tier-1 language support only (`en, es, fr, de,
+  it, pt, nl, pl, tr, sv, da, fi, no, el, ms, sw, ar, ko`); ja/he/ru/zh/
+  hi error out with a clear message.  No external deps.
+- `src/t3_mtl.{h,cpp}` — Llama-520M forward pass: RMSNorm + SwiGLU MLP +
+  separate Q/K/V no-bias + RoPE-llama3 (NEOX half-split) +
+  `flash_attn_ext` + dual KV cache for CFG.  Cond assembly covers
+  spkr_enc + Perceiver (32-query cross then self-attn, `AttentionBlock2`
+  LN+bias, F32) + emotion_adv_fc + learned text/speech positional
+  embeddings.  Exposes stage builders (cond/text/inputs/layers/head) so
+  the parity harness can inject Python-dumped intermediates at any
+  boundary.
+- `src/test_t3_mtl_stages.cpp` — staged parity harness (all stages pass
+  within 5e-4 rel against the Python reference; logits land at 1.4e-3
+  rel, consistent with cumulative F16 drift through 30 layers).
+
+**Sampling path.**  `chatterbox_sampling_params` gained `cfg_weight` and
+`min_p`.  Sampler order in `sample_next_token_mtl` matches the Python
+`ChatterboxMultilingualTTS.generate` default:
+`cfg_combine → rep_penalty → temp → min_p → top_p → (top_k) → multinomial`.
+CFG runs cond and uncond as two independent T3 forwards (dual KV cache,
+`memory_k{_uncond}` / `memory_v{_uncond}` in the model struct), combined
+at the logit level.
+
+**S3Gen dispatch.**  `chatterbox_tts.cpp` reads `s3gen.meanflow /
+n_timesteps / cfg_rate` once at load time and branches the CFM inner
+loop:
+
+- meanflow: 2-step linear `t_span` + `time_embed_mixer` + `noised_mels`
+  overlay (unchanged Turbo path).
+- standard: 10-step cosine `t_span`, no mixer, CFG via either two
+  estimator calls per step or a batched-estimator variant (see
+  "batched CFM" below).
+
+**Voice cloning** works unchanged on MTL because the 5-tensor
+conditioning (`speaker_emb`, `cond_prompt_speech_tokens`, `embedding`,
+`prompt_token`, `prompt_feat`) is identical between variants.  Verified
+end-to-end with `jfk.wav` in Spanish: VoiceEncoder + S3TokenizerV2 +
+CAMPPlus + native mel extraction all fire and produce a plausibly-JFK
+Spanish wav.
+
+#### Staged parity (§3.17 milestone M1..M5)
+
+Mirroring the Turbo staged-verification pattern (§3.3 S3Gen A..F).  M4
+with Metal, F16 weights, 7-token prompt "Hello there.":
+
+| Stage | n      | rel_err | max_abs  | max\|ref\| |
+|-------|-------:|--------:|---------:|-----------:|
+| cond_emb               | 34816 | 1.5e-4 | 4.6e-4 | 3.11 |
+| text_emb + pos (cond)  |  9216 | 2.1e-4 | 6.1e-5 | 0.29 |
+| inputs_embeds (cond)   | 46080 | 1.5e-4 | 4.6e-4 | 3.11 |
+| inputs_embeds (uncond) | 46080 | 1.5e-4 | 4.6e-4 | 3.11 |
+| layer  0 out (1 block) | 46080 | 7.3e-5 | 4.8e-4 | 6.58 |
+| layer 14 out (15)      | 46080 | 2.9e-4 | 3.9e-1 | 1344 |
+| layer 29 out (30 full) | 46080 | 2.9e-4 | 3.9e-1 | 1344 |
+| speech_logits cond     |  8194 | 1.4e-3 | 1.2e-2 | 8.18 |
+| speech_logits uncond   |  8194 | 1.4e-3 | 1.4e-2 | 9.46 |
+
+All F16 accumulation drift; argmax stable, audio perceptually correct.
+
+#### Performance (M4, seed 42, same prompt)
+
+Metal and CPU (4 threads) back-to-back on a cool machine, F16 weights
+throughout:
+
+| Config                              | T3 infer          | S3Gen | Audio | RTF   |
+|-------------------------------------|-------------------:|------:|------:|------:|
+| Turbo Metal                         | 788 ms / 73 tok   |  768 ms | 3040 ms | 0.51 |
+| Turbo CPU 4t                        | 1721 ms / 73 tok  | 3334 ms | 3040 ms | 1.66 |
+| MTL Metal *(batched CFM)*           | 1865 ms / 61 tok  | 2247 ms | 2560 ms | 1.61 |
+| MTL CPU 4t *(2-call CFM)*           | 2711 ms / 71 tok  | 8029 ms | 2960 ms | 3.63 |
+
+**MTL is ~2.2× slower than Turbo on CPU** — very close to the
+architectural ceiling:
+
+- 30 Llama layers vs 24 GPT-2 layers → ~1.25×
+- CFG doubles T3 forward passes per step → another 1.6–2× on T3
+- CFM runs 10 steps × 2 CFG passes = 20 estimator calls vs Turbo's 2
+  meanflow steps → 10× call-count multiplier, ~4–5× wall because the
+  per-call cost is lower on MTL (estimator cache reused, smaller
+  effective footprint per call)
+
+On a thermally-loaded M4 (other agents running) the same measurements
+showed RTF ≈ 6.3 — almost 2× worse than the cool-machine number.  This
+is the variance envelope to keep in mind when benchmarking.
+
+#### Batched CFM (Metal win, CPU regression)
+
+First optimisation attempt: fold the CFG cond+uncond CFM passes into a
+single `batch=2` decoder forward so the weight reads amortise across
+both passes instead of paying them twice.
+
+New helpers (`src/chatterbox_tts.cpp`): `conv1d_f32_b`, `cfm_causal_block_b`,
+`cfm_causal_k3_b`, `cfm_resnet_b`, `basic_tfm_b`, `apply_tfm_stack_b`, and
+a new `cfm_estimator_forward_b2` that packs cond + uncond inputs along
+ne[2] throughout.
+
+Subtle ggml gotcha: `ggml_mul_mat(a, b)` broadcasts `a` over `b`'s
+ne[2..3]; `ggml_can_mul_mat` rejects the opposite direction.  When
+`im2col` has a batch dim and the kernel is 2D, the kernel has to be the
+*first* operand, and the result then needs a
+`cont(permute(_, 1, 0, 2, 3))` back to the downstream-friendly
+`(L_out, OC, B)` layout.  That permute costs real memory traffic.
+
+Measured on M4, same 2-word sentence as above:
+
+| Config               | F16 baseline | Batched CFM | Δ       |
+|----------------------|-------------:|------------:|--------:|
+| MTL Metal (S3Gen)    |     2451 ms  |    2247 ms  | **−9%** |
+| MTL CPU 4t (S3Gen)   |    19948 ms  |   22165 ms  | **+11%** |
+
+Metal wins by ~9 % because kernel dispatch amortises (same number of
+heavier kernels instead of twice as many light ones).  CPU loses
+because ggml-cpu has essentially zero dispatch overhead already, and
+`basic_tfm_b`'s `permute + cont` on Q/K/V now runs over a larger
+(`HD, T, H, 2`) tensor every attention block (4 blocks × 13 resnet
+blocks × 10 steps).  The extra memory traffic outweighs the amortised
+weight reads.
+
+Fix: gate the batched path on backend type — `const bool use_b2 =
+!meanflow && cfg_rate != 0 && !ggml_backend_is_cpu(m.backend);`  Keeps
+Metal fast, leaves CPU on the clean two-call path.
+
+#### Reference comparison vs onnxruntime (Multilingual, M4 CPU, F16)
+
+Head-to-head through
+[`examples/chatterbox-multilingual-bench.js`](https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js)
+in the `qvac-lib-infer-onnx-tts` package.  Same prompt (`"Hola mundo,
+esta es una prueba multilingue."`), same `jfk.wav` reference, same 4
+CPU threads:
+
+```
+                     onnxruntime-fp16   ggml-cpu-f16
+  -------------------------------------------------
+  cold load               42 829 ms        ~500 ms   (85x faster)
+  inference wall          51 447 ms     10 168 ms   (5.06x faster)
+  audio produced           2 740 ms      2 400 ms
+  RTF                        18.78          4.24
+  CFG enabled                  no           yes
+```
+
+A few things worth calling out:
+
+- **CFG disabled on the ONNX side.**  Its multilingual export currently
+  ships without `text_emb_weight.bin` and logs `CFG disabled` at load,
+  so it's running **half** the compute of the ggml pipeline (1 T3 pass
+  per step instead of 2, and no CFG combine on CFM).  If the ONNX CFG
+  path were wired up, its RTF would roughly double to ~37 and the gap
+  vs ggml would jump from 5× to ~9×.
+- **Cold load is 85× faster on ggml** (0.5 s vs 42.8 s).  That's
+  entirely an onnxruntime cost — initialising 4 session objects over
+  1 GB of `external_data` .onnx_data blobs.  ggml mmaps the two GGUFs
+  and rebinds through the backend allocator in half a second.
+- **Quality parity**: `bench-onnx.wav` and `bench-ggml.wav` are both
+  plausibly the same Spanish sentence in the JFK-cloned voice; the
+  per-sample waveform differs (different samplers, different RNG) but
+  the speaker identity and content match by ear.
+
+Comparison is reproducible with:
+
+```bash
+cd qvac2/packages/qvac-lib-infer-onnx-tts
+bare examples/chatterbox-multilingual-bench.js \
+    --language es \
+    --text "Hola mundo, esta es una prueba multilingue." \
+    --warmup 0 --runs 1
+```
+
+(Add `--skip-onnx` or `--skip-ggml` to isolate one side.)
+
+#### What's next for MTL
+
+Optimisations still on the table, ordered by expected CPU impact:
+
+1. **Q8_0 / Q4_0 T3 for MTL**.  Converter already supports it (bit-exact
+   to F16 on Turbo per §3.10); T3 is 25 % of the CPU wall time so this
+   is a ~1.5× T3 win but only ~12 % total.  Small compared to #2.
+2. **Quantized CFM estimator weights**.  ~75 % of CPU wall time is the
+   10-step CFM; halving its weight-read cost via Q8_0 on the U-Net /
+   transformer linears is the biggest remaining CPU lever.  Needs a
+   small converter change and a validation pass that quantized
+   `mul_mat` kernels actually speed these specific shapes up (small-d
+   convs can regress at Q8_0 on ggml-cpu — cf. §3.8 Attempt 7).
+3. **Reduce CFM step count at runtime**.  Python's meanflow uses 2
+   steps; standard CFM trained at 10 may tolerate 6–7 with no audible
+   loss.  Trivial to plumb via the existing `--stream-cfm-steps` flag.
+4. **ja/he/ru/zh/hi language support**.  Separate sub-projects per
+   language (pykakasi / dicta / Russian stresser / Cangjie+pkuseg /
+   Hindi phonemizer).  Easiest to ship as optional Python pre-processing
+   that emits already-tokenised IDs.
+
 ---
 
 ## Verification approach
