@@ -665,9 +665,6 @@ struct cli_params {
     // Exclusive with --text / --tokens-file.
     std::string input_file;
     int32_t     input_poll_ms    = 50;   // ms to sleep when no new bytes yet
-    int32_t     input_flush_ms   = 0;    // if > 0, flush a non-empty buffer
-                                         // after this many ms of inactivity
-                                         // even without a sentence terminator
     std::string input_eof_marker;        // optional; stops reading when seen
     bool        input_by_line    = false; // one request per \n; don't split
                                           // on . ! ? within a line
@@ -740,12 +737,6 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          Exclusive with --text / --tokens-file.\n");
     fprintf(stderr, "  --input-poll-ms N       Polling interval when the input file has no new\n");
     fprintf(stderr, "                          bytes.  (default: 50)\n");
-    fprintf(stderr, "  --input-flush-ms N      Force-synthesise a non-empty buffer once N ms have\n");
-    fprintf(stderr, "                          passed without new input, even if no sentence\n");
-    fprintf(stderr, "                          terminator (. ! ? newline) has arrived.  Useful when\n");
-    fprintf(stderr, "                          the upstream occasionally writes tokens without\n");
-    fprintf(stderr, "                          punctuation (streaming LLMs, live transcription).\n");
-    fprintf(stderr, "                          0 = off; only terminators flush.  (default: 0)\n");
     fprintf(stderr, "  --input-eof-marker STR  When this string is seen in the input, flush any\n");
     fprintf(stderr, "                          preceding text, synthesise it, and exit cleanly.\n");
     fprintf(stderr, "                          (default: none = run until SIGINT)\n");
@@ -834,7 +825,6 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--stream-cfm-steps")          { if (!parse_int("--stream-cfm-steps",          params.stream_cfm_steps))          return false; }
         else if (arg == "--input-file")       { auto v = next("--input-file");       if (!v) return false; params.input_file = v; }
         else if (arg == "--input-poll-ms")    { if (!parse_int("--input-poll-ms",  params.input_poll_ms))  return false; }
-        else if (arg == "--input-flush-ms")   { if (!parse_int("--input-flush-ms", params.input_flush_ms)) return false; }
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
         else if (arg == "--input-by-line")    { params.input_by_line = true; }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
@@ -1908,10 +1898,6 @@ int main(int argc, char ** argv) {
             double  first_audio_t_ms       = -1.0;
             const double live_t0_ms        = 1e-3 * ggml_time_us();
 
-            std::string live_banner_suffix;
-            if (params.input_flush_ms > 0) {
-                live_banner_suffix = ", idle-flush=" + std::to_string(params.input_flush_ms) + "ms";
-            }
             const char * stop_hint =
                 stdin_is_tty
                     ? (params.input_by_line
@@ -1923,8 +1909,8 @@ int main(int argc, char ** argv) {
             const char * src_label =
                 input_from_stdin ? "<stdin>" : params.input_file.c_str();
             const char * mode_label = params.input_by_line ? ", line-mode" : "";
-            fprintf(stderr, "\n=== live input: %s (%s%s%s) ===\n",
-                    src_label, stop_hint, mode_label, live_banner_suffix.c_str());
+            fprintf(stderr, "\n=== live input: %s (%s%s) ===\n",
+                    src_label, stop_hint, mode_label);
             if (stdin_is_tty) {
                 // Prompt lives on stderr so it doesn't collide with the
                 // raw-PCM stream on stdout.
@@ -2193,7 +2179,6 @@ int main(int argc, char ** argv) {
             // --- Main tail -f loop ---
             int  loop_rc     = 0;
             bool stdin_eof   = false;  // only meaningful when reading from stdin
-            auto last_data_at = std::chrono::steady_clock::now();
             // Re-prints the interactive prompt once per "ready for input"
             // state (after start-up, and after each synthesised sentence
             // when nothing is queued).
@@ -2227,7 +2212,6 @@ int main(int argc, char ** argv) {
                 const size_t n = (r > 0) ? (size_t)r : 0;
                 if (n > 0) {
                     pending.append(read_buf.data(), n);
-                    last_data_at = std::chrono::steady_clock::now();
                     if (!params.input_eof_marker.empty()) {
                         const auto pos = pending.find(params.input_eof_marker);
                         if (pos != std::string::npos) {
@@ -2251,7 +2235,6 @@ int main(int argc, char ** argv) {
                     loop_rc = synth_sentence(sentence);
                     sentence.clear();
                     synthesised_any = true;
-                    last_data_at = std::chrono::steady_clock::now();
                     if (loop_rc != 0 || live_stop.load()) break;
                 }
                 if (loop_rc != 0) break;
@@ -2263,25 +2246,6 @@ int main(int argc, char ** argv) {
                         loop_rc = synth_sentence(tail);
                     }
                     break;
-                }
-
-                // Idle-flush: if the upstream has gone quiet for
-                // --input-flush-ms and the buffer has un-terminated text,
-                // synthesise what we have so the player doesn't stall
-                // waiting for punctuation the upstream never writes.
-                if (params.input_flush_ms > 0 && !pending.empty()) {
-                    const auto idle_ms =
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - last_data_at).count();
-                    if (idle_ms >= params.input_flush_ms) {
-                        std::string tail;
-                        if (pop_sentence(tail, /*force_final=*/true)) {
-                            loop_rc = synth_sentence(tail);
-                            synthesised_any = true;
-                            last_data_at = std::chrono::steady_clock::now();
-                            if (loop_rc != 0) break;
-                        }
-                    }
                 }
 
                 if (synthesised_any) {
