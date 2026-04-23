@@ -1972,6 +1972,29 @@ int main(int argc, char ** argv) {
             auto synth_sentence = [&](const std::string & raw_sentence) -> int {
                 std::string normalized = gpt2_bpe::punc_norm(raw_sentence);
                 if (normalized.empty()) return 0;
+
+                // Reject inputs that are only punctuation / whitespace.
+                // Otherwise T3 happily hallucinates ~1-2 s of speaker-biased
+                // audio for e.g. the single token "." — which with a cloned
+                // voice can come out sounding like a word from the previous
+                // utterance (reported live: "i heard 'you?' in seg 3 audio
+                // where seg 3 was just '.'").  Nothing sensible comes out of
+                // such inputs, so just drop them and keep the prompt.
+                bool has_word_char = false;
+                for (unsigned char c : normalized) {
+                    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c >= 0x80 /* UTF-8 cont */) {
+                        has_word_char = true;
+                        break;
+                    }
+                }
+                if (!has_word_char) {
+                    if (stdin_is_tty) {
+                        fprintf(stderr, "[skipped: no word characters]\n");
+                    }
+                    return 0;
+                }
+
                 std::vector<int32_t> text_toks = bpe_live.tokenize(normalized);
                 if (text_toks.empty()) return 0;
 
