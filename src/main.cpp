@@ -664,7 +664,6 @@ struct cli_params {
     // Requires --s3gen-gguf, --stream-chunk-tokens > 0, --out -.
     // Exclusive with --text / --tokens-file.
     std::string input_file;
-    int32_t     input_poll_ms    = 50;   // ms to sleep when no new bytes yet
     std::string input_eof_marker;        // optional; stops reading when seen
     bool        input_by_line    = false; // one request per \n; don't split
                                           // on . ! ? within a line
@@ -735,8 +734,6 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          SIGINT or stdin EOF / --input-eof-marker.  Requires\n");
     fprintf(stderr, "                          --s3gen-gguf, --stream-chunk-tokens > 0, --out -.\n");
     fprintf(stderr, "                          Exclusive with --text / --tokens-file.\n");
-    fprintf(stderr, "  --input-poll-ms N       Polling interval when the input file has no new\n");
-    fprintf(stderr, "                          bytes.  (default: 50)\n");
     fprintf(stderr, "  --input-eof-marker STR  When this string is seen in the input, flush any\n");
     fprintf(stderr, "                          preceding text, synthesise it, and exit cleanly.\n");
     fprintf(stderr, "                          (default: none = run until SIGINT)\n");
@@ -824,7 +821,6 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--stream-first-chunk-tokens") { if (!parse_int("--stream-first-chunk-tokens", params.stream_first_chunk_tokens)) return false; }
         else if (arg == "--stream-cfm-steps")          { if (!parse_int("--stream-cfm-steps",          params.stream_cfm_steps))          return false; }
         else if (arg == "--input-file")       { auto v = next("--input-file");       if (!v) return false; params.input_file = v; }
-        else if (arg == "--input-poll-ms")    { if (!parse_int("--input-poll-ms",  params.input_poll_ms))  return false; }
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
         else if (arg == "--input-by-line")    { params.input_by_line = true; }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
@@ -2177,6 +2173,14 @@ int main(int argc, char ** argv) {
             };
 
             // --- Main tail -f loop ---
+            //
+            // INPUT_POLL_MS is the quiet-period sleep between read() attempts
+            // when the input file has no new bytes and between select()
+            // wake-ups on a TTY (so SIGINT is noticed without the user also
+            // pressing Enter).  25 ms gives ~25 ms first-byte latency for
+            // interactive appends, which is well below perception threshold
+            // (and the syscall is essentially free at that rate).
+            constexpr int INPUT_POLL_MS = 25;
             int  loop_rc     = 0;
             bool stdin_eof   = false;  // only meaningful when reading from stdin
             // Re-prints the interactive prompt once per "ready for input"
@@ -2197,7 +2201,7 @@ int main(int argc, char ** argv) {
                     fd_set rf; FD_ZERO(&rf); FD_SET(in_fd, &rf);
                     struct timeval tv;
                     tv.tv_sec  = 0;
-                    tv.tv_usec = std::max(1, params.input_poll_ms) * 1000;
+                    tv.tv_usec = INPUT_POLL_MS * 1000;
                     int sv = select(in_fd + 1, &rf, nullptr, nullptr, &tv);
                     if (sv <= 0) {
                         if (live_stop.load()) break;
@@ -2254,7 +2258,7 @@ int main(int argc, char ** argv) {
 
                 if (n == 0) {
                     std::this_thread::sleep_for(
-                        std::chrono::milliseconds(params.input_poll_ms));
+                        std::chrono::milliseconds(INPUT_POLL_MS));
                 }
             }
 
