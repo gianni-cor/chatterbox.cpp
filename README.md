@@ -118,33 +118,29 @@ This produces the main binary plus a set of per-stage validation harnesses:
 You'll normally only need `build/chatterbox`; the `test-*` binaries are
 there for the staged-verification methodology in `PROGRESS.md`.
 
-### Alternative: consume ggml from vcpkg (`QVAC_TTS_USE_SYSTEM_GGML`)
+### Alternative: consume ggml from vcpkg (`TTS_CPP_USE_SYSTEM_GGML`)
 
-Downstream projects that already vendor ggml through vcpkg (e.g. the
-`@qvac/tts-ggml` Bare addon) can skip `setup-ggml.sh` and instead point
-the build at a pre-installed ggml package:
+Downstream projects that already vendor ggml through vcpkg can skip
+`setup-ggml.sh` and instead point the build at a pre-installed ggml
+package:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DQVAC_TTS_USE_SYSTEM_GGML=ON
+  -DTTS_CPP_USE_SYSTEM_GGML=ON
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
 
-When `QVAC_TTS_USE_SYSTEM_GGML=ON`, the top-level `CMakeLists.txt`
+When `TTS_CPP_USE_SYSTEM_GGML=ON`, the top-level `CMakeLists.txt`
 swaps `add_subdirectory(ggml)` for `find_package(ggml CONFIG REQUIRED)`
 and aliases the imported `ggml::ggml` target onto the plain `ggml` name
 that the rest of the build uses.  The local `./ggml/` tree is never
-read.  The expected source of truth for the imported package is the
-`ggml` overlay port published from
-[`tetherto/qvac-ext-ggml`][qvac-ext-ggml] (currently a `tts` branch
-that carries the same Metal patch found under `patches/`).  This shape
-mirrors `qvac-ext-stable-diffusion.cpp`'s `SD_USE_SYSTEM_GGML`.
+read.  The imported package is expected to provide the same Metal
+patch carried under `patches/`.  This shape mirrors
+`stable-diffusion.cpp`'s `SD_USE_SYSTEM_GGML`.
 
-The default (`QVAC_TTS_USE_SYSTEM_GGML=OFF`) preserves the standalone
+The default (`TTS_CPP_USE_SYSTEM_GGML=OFF`) preserves the standalone
 flow above untouched, so this is purely an opt-in escape hatch for
 package-manager-driven builds.
-
-[qvac-ext-ggml]: https://github.com/tetherto/qvac-ext-ggml
 
 ## 2. One-time: convert weights
 
@@ -210,7 +206,7 @@ Swap `q8_0` → `q4_0` (or `q5_0`) for a more aggressive variant.  T3's
 original converter also accepts `--quant` if you prefer to quantize at
 conversion time instead of after.
 
-Measured on the QVAC paragraph (M3 Ultra, Metal, streaming mode
+Measured on a representative paragraph (M3 Ultra, Metal, streaming mode
 `--stream-chunk-tokens 25 --max-sentence-chars 100`):
 
 | T3 / S3Gen                | total size | first-audio | total wall | cos sim¹ |
@@ -665,7 +661,7 @@ python scripts/reference-t3-turbo.py \
 chatterbox.cpp/
   ggml/                          pristine ggml clone (not tracked; populated
                                    by scripts/setup-ggml.sh, or skipped entirely
-                                   when building with -DQVAC_TTS_USE_SYSTEM_GGML=ON)
+                                   when building with -DTTS_CPP_USE_SYSTEM_GGML=ON)
   src/
     main.cpp                     CLI + T3 runtime            (chatterbox)
     chatterbox_tts.cpp           S3Gen + HiFT pipeline       (linked into chatterbox)

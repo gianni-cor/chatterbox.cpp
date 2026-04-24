@@ -10,8 +10,8 @@
 //
 // Usage:
 //
-//     using qvac_tts::chatterbox::Engine;
-//     using qvac_tts::chatterbox::EngineOptions;
+//     using tts_cpp::chatterbox::Engine;
+//     using tts_cpp::chatterbox::EngineOptions;
 //
 //     EngineOptions opts;
 //     opts.t3_gguf_path    = "models/chatterbox-t3-turbo.gguf";
@@ -39,7 +39,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_tts::chatterbox {
+namespace tts_cpp::chatterbox {
 
 struct EngineOptions {
     // Required: T3 GGUF and S3Gen GGUF paths (as produced by the Python
@@ -47,8 +47,8 @@ struct EngineOptions {
     std::string t3_gguf_path;
     std::string s3gen_gguf_path;
 
-    // Optional voice cloning.  Exactly one of these two paths may be set;
-    // if both are empty the engine uses the built-in reference voice
+    // Optional voice cloning.  Either (or both) of these two paths may be
+    // set; if both are empty the engine uses the built-in reference voice
     // embedded in the S3Gen GGUF.
     //
     //   reference_audio: path to a mono wav >= 5 s.  The engine computes
@@ -58,7 +58,7 @@ struct EngineOptions {
     //                    every synthesize() call.
     //
     //   voice_dir:       path to a directory of pre-baked .npy tensors
-    //                    (the layout produced by `qvac-tts --save-voice`).
+    //                    (the layout produced by `tts-cpp --save-voice`).
     //                    Faster to load than reference_audio.  When both
     //                    are provided, reference_audio takes precedence for
     //                    any tensor missing from voice_dir.
@@ -196,4 +196,4 @@ private:
     std::unique_ptr<Impl> pimpl_;
 };
 
-} // namespace qvac_tts::chatterbox
+} // namespace tts_cpp::chatterbox

@@ -1,11 +1,11 @@
 #pragma once
 
-// Top-level QVAC TTS library entry points.
+// Top-level tts-cpp library entry points.
 //
 // The library currently ships the Chatterbox model pipeline.  Additional
 // engines (e.g. the Chatterbox multilingual model, other TTS backends) will
 // land under the same umbrella and should prefer headers under
-// <qvac-tts/...> for the generic API and <qvac-tts/<engine>/...> for
+// <tts-cpp/...> for the generic API and <tts-cpp/<engine>/...> for
 // engine-specific details.
 //
 // Two layers of API are exposed today:
@@ -14,17 +14,17 @@
 //      implementation wraps the CLI's argv path; a proper struct-based
 //      public API will land as the code is split out of src/main.cpp.
 //      Until then, callers building against the library can invoke
-//      `qvac_tts_cli_main(argc, argv)` with the same flags accepted by the
-//      `qvac-tts` executable.
+//      `tts_cpp_cli_main(argc, argv)` with the same flags accepted by the
+//      `tts-cpp` executable.
 //
 //   2. Lower-level per-engine APIs, e.g. the Chatterbox S3Gen + HiFT
-//      back-half in <qvac-tts/chatterbox/s3gen_pipeline.h>.
+//      back-half in <tts-cpp/chatterbox/s3gen_pipeline.h>.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int qvac_tts_cli_main(int argc, char ** argv);
+int tts_cpp_cli_main(int argc, char ** argv);
 
 #ifdef __cplusplus
 }

@@ -10,6 +10,13 @@
 #include <string>
 #include <vector>
 
+namespace tts_cpp::chatterbox {
+
+inline constexpr int kS3GenSilenceToken    = 4299;
+inline constexpr int kS3GenLookaheadTokens = 3;
+
+} // namespace tts_cpp::chatterbox
+
 struct s3gen_synthesize_opts {
     std::string s3gen_gguf_path;  // required: chatterbox-s3gen.gguf
 
@@ -168,7 +175,7 @@ int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers);
 // Release the internal S3Gen cache (weights + backend + allocator).  Long-
 // running processes that cycle through models, as well as wrappers that
 // need deterministic teardown before the host backend is destroyed (e.g.
-// the qvac-tts-ggml Bare addon), should call this before tearing down
+// the tts-cpp Bare addon), should call this before tearing down
 // their own ggml backend.  Otherwise the cache is freed at process exit
 // via static destructors, after which the ggml-metal global device may
 // have already been finalised — tripping its resource-leak assertion.

@@ -3,11 +3,11 @@
 // Library-internal declarations for the T3 (GPT-2 Medium autoregressive
 // text -> speech tokens) front-half of the Chatterbox pipeline.  Shared
 // between src/main.cpp (CLI) and src/chatterbox_engine.cpp (public engine
-// API under include/qvac-tts/chatterbox/engine.h).
+// API under include/tts-cpp/chatterbox/engine.h).
 //
 // This header is NOT installed with the library (see CMakeLists.txt
 // install rules) — it's part of the implementation, not the public
-// surface.  Public consumers should use <qvac-tts/chatterbox/engine.h>.
+// surface.  Public consumers should use <tts-cpp/chatterbox/engine.h>.
 //
 // Names stay in the global namespace to keep main.cpp's diff minimal
 // during the extraction (main.cpp had them as static globals/functions).

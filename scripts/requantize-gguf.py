@@ -26,7 +26,7 @@ Usage:
 
     # Q4_0 is the same, last arg is just `q4_0`.
 
-Quality trade-off (measured on the QVAC paragraph, Metal / M3 Ultra):
+Quality trade-off (measured on a representative paragraph, Metal / M3 Ultra):
   F32 (default)   — baseline
   Q8_0            — essentially bit-exact, cos-sim > 0.99 vs baseline
   Q4_0            — different CFM ODE trajectory → different sample;

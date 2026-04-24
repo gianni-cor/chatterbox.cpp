@@ -39,8 +39,8 @@
 #include <thread>
 #include <vector>
 
-#include "qvac-tts/qvac-tts.h"
-#include "qvac-tts/chatterbox/s3gen_pipeline.h"
+#include "tts-cpp/tts-cpp.h"
+#include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "chatterbox_t3_internal.h"
 #include "npy.h"
 #include "voice_features.h"
@@ -255,7 +255,7 @@ bool compute_prompt_feat_native(const std::string & wav_path,
                                        const std::string & s3gen_gguf_path,
                                        std::vector<float> & out_feat,
                                        int & out_rows,
-                                       bool verbose = false)
+                                       bool verbose)
 {
     if (verbose) fprintf(stderr, "voice: loading %s\n", wav_path.c_str());
     std::vector<float> wav;
@@ -316,8 +316,8 @@ bool compute_prompt_feat_native(const std::string & wav_path,
 bool compute_embedding_native(const std::string & wav_path,
                                      const std::string & s3gen_gguf_path,
                                      std::vector<float> & out_emb,
-                                     ggml_backend_t backend = nullptr,
-                                     bool verbose = false)
+                                     ggml_backend_t backend,
+                                     bool verbose)
 {
     campplus_weights w;
     if (!campplus_load(s3gen_gguf_path, w)) {
@@ -1380,7 +1380,7 @@ void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*ud*/) {
     }
 }
 
-int qvac_tts_cli_main(int argc, char ** argv) {
+int tts_cpp_cli_main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
     if (!parse_args(argc, argv, params)) {
@@ -1802,7 +1802,7 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                 ggml_backend_get_default_buffer_type(model.backend));
             std::mt19937 rng_live(params.seed);
 
-            constexpr int S3GEN_SIL = 4299;
+            constexpr int S3GEN_SIL = tts_cpp::chatterbox::kS3GenSilenceToken;
             const int sr            = opts.sr ? opts.sr : 24000;
             const int chunk_n       = params.stream_chunk_tokens;
             const int first_chunk_n = params.stream_first_chunk_tokens > 0
@@ -2028,9 +2028,9 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                 // --- S3Gen + HiFT streaming (same boundary + cache logic
                 //     as the multi-segment streaming path below) ---
                 std::vector<int32_t> seg_toks = std::move(generated);
-                seg_toks.push_back(S3GEN_SIL);
-                seg_toks.push_back(S3GEN_SIL);
-                seg_toks.push_back(S3GEN_SIL);
+                for (int i = 0; i < tts_cpp::chatterbox::kS3GenLookaheadTokens; ++i) {
+                    seg_toks.push_back(S3GEN_SIL);
+                }
                 const int total_n   = (int)seg_toks.size();
                 const int seg_first = (segments_done == 0) ? first_chunk_n : chunk_n;
 
@@ -2541,7 +2541,7 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                 // Mirrors scripts/dump-streaming-reference.py.  Appends 3
                 // S3GEN_SIL tokens at each segment's tail so every chunk's
                 // `append_lookahead_silence=false` is safe.
-                constexpr int S3GEN_SIL = 4299;
+                constexpr int S3GEN_SIL = tts_cpp::chatterbox::kS3GenSilenceToken;
 
                 const int chunk_n       = params.stream_chunk_tokens;
                 const int first_chunk_n = params.stream_first_chunk_tokens > 0
@@ -2568,9 +2568,9 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                 for (size_t si = 0; si < N_SEG; ++si) {
                     ensure_t3(si);
                     std::vector<int32_t> seg_toks = seg_generated[si];
-                    seg_toks.push_back(S3GEN_SIL);
-                    seg_toks.push_back(S3GEN_SIL);
-                    seg_toks.push_back(S3GEN_SIL);
+                    for (int i = 0; i < tts_cpp::chatterbox::kS3GenLookaheadTokens; ++i) {
+                        seg_toks.push_back(S3GEN_SIL);
+                    }
                     const int total_n = (int)seg_toks.size();
 
                     // Chunk boundaries within this segment.  The small

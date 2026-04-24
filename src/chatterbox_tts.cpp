@@ -1262,7 +1262,7 @@ static std::vector<int32_t> read_tokens_file(const std::string & path) {
 // s3gen GGUF) and writes a 24 kHz wav.
 // ============================================================================
 
-#include "qvac-tts/chatterbox/s3gen_pipeline.h"
+#include "tts-cpp/chatterbox/s3gen_pipeline.h"
 
 int s3gen_synthesize_to_wav(
     const std::vector<int32_t> & speech_tokens,
@@ -1366,7 +1366,7 @@ int s3gen_synthesize_to_wav(
     // that: the lookahead will come from real speech tokens in the next
     // chunk, and we'll trim the 6 mel frames corresponding to the pre-
     // lookahead window right after CFM.
-    const int32_t S3GEN_SIL = 4299;
+    const int32_t S3GEN_SIL = tts_cpp::chatterbox::kS3GenSilenceToken;
     const int32_t VOCAB_SIZE = 6561;
     std::vector<int32_t> padded;
     for (int32_t t : speech_tokens) {

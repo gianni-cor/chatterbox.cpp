@@ -1,4 +1,4 @@
-#include "qvac-tts/chatterbox/engine.h"
+#include "tts-cpp/chatterbox/engine.h"
 
 #include <atomic>
 #include <chrono>
@@ -12,11 +12,11 @@
 #include "chatterbox_t3_internal.h"
 #include "gpt2_bpe.h"
 #include "npy.h"
-#include "qvac-tts/chatterbox/s3gen_pipeline.h"
+#include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "voice_encoder.h"
 #include "voice_features.h"
 
-namespace qvac_tts::chatterbox {
+namespace tts_cpp::chatterbox {
 
 namespace {
 
@@ -103,8 +103,8 @@ struct Engine::Impl {
             bake_voice_conditioning();
         } catch (...) {
             wait_for_preload(s3gen_preload_thread);
-            ggml_gallocr_free(allocr);
-            allocr = nullptr;
+            s3gen_unload();
+            if (allocr) { ggml_gallocr_free(allocr); allocr = nullptr; }
             free_model();
             throw;
         }
@@ -404,12 +404,10 @@ struct Engine::Impl {
         const StreamCallback & on_chunk,
         SynthesisResult && partial) {
 
-        constexpr int S3GEN_SIL = 4299;
-
         std::vector<int32_t> seg_toks = speech_tokens;
-        seg_toks.push_back(S3GEN_SIL);
-        seg_toks.push_back(S3GEN_SIL);
-        seg_toks.push_back(S3GEN_SIL);
+        for (int i = 0; i < kS3GenLookaheadTokens; ++i) {
+            seg_toks.push_back(kS3GenSilenceToken);
+        }
         const int total_n = (int) seg_toks.size();
 
         const int chunk_n       = opts.stream_chunk_tokens;
@@ -540,4 +538,4 @@ const EngineOptions & Engine::options() const {
     return pimpl_->opts;
 }
 
-} // namespace qvac_tts::chatterbox
+} // namespace tts_cpp::chatterbox
