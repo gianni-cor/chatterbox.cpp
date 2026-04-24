@@ -217,8 +217,16 @@ std::string gpt2_bpe::punc_norm(const std::string & text) {
     replace_all(t, "\xe2\x80\x98", "'");     // '
     replace_all(t, "\xe2\x80\x99", "'");     // '
 
-    // strip trailing spaces
-    while (!t.empty() && t.back() == ' ') t.pop_back();
+    // strip trailing whitespace (spaces, tabs, newlines).  Sentences
+    // coming from the live tail-follow reader typically end in '\n' or
+    // ' ' because that's the terminator pop_sentence used; leaving that
+    // in place confuses the "add period if no ending punctuation" step
+    // below (it would append '.' after the newline, producing ".\n.").
+    while (!t.empty()) {
+        char b = t.back();
+        if (b == ' ' || b == '\t' || b == '\n' || b == '\r') t.pop_back();
+        else break;
+    }
 
     // add period if no ending punctuation
     if (!t.empty()) {

@@ -886,6 +886,112 @@ worth committing: matches Vulkan's fusion surface, fixes the latent
 §3.15 bias correctness bug, and closes the last dispatch-per-linear
 gap vs Vulkan.
 
+### 3.17  Live / streaming input and interactive TTY mode
+
+The CLI had always been single-shot (pass `--text`, get one wav),
+which meant anything "keep the model warm and speak whatever I send"
+required re-spawning the binary per request.  Added a long-running
+mode driven by `--input-file PATH`: the binary `tail -f`'s `PATH`,
+splits on sentence terminators, and pipes raw PCM (s16le @ 24 kHz)
+to stdout chunk-by-chunk.
+
+Key details that came up during the implementation:
+
+- **`fread` + `clearerr` doesn't tail-follow on macOS.**  Once the
+  stdio `FILE*` hits EOF, the readahead buffer can keep returning 0
+  from `fread` for many subsequent calls even after the writer has
+  appended new bytes and `clearerr()` has been called.  Switched to
+  `open()` + `read()` on a plain fd so the kernel is always consulted
+  for the current file state — fixed the "second process's writes
+  get dropped" symptom.
+- **Accept `<.!?>` followed by an uppercase letter as a sentence
+  break**, in addition to the original `<.!?>` + whitespace /
+  newline / end-of-input.  LLMs / transcribers that pack sentences
+  back-to-back without a space (`"Hello.World.Foo."`) were otherwise
+  bundling everything into one enormous utterance.
+- **Interactive stdin mode** — `--input-file -` reads from
+  `STDIN_FILENO` directly (no `open("/dev/stdin")` which gets a
+  fresh-offset fd on some systems).  When stdin is a TTY, the binary
+  prints a `> ` prompt on stderr (so it can't collide with the raw
+  PCM stream on stdout), wraps the `read()` in a `select()` with a
+  25 ms poll so SIGINT is noticed without the user also having to
+  press Enter, and re-prompts after each synthesised sentence.
+  Single process, pipe stdout straight to `sox play`, type a
+  sentence, hear it back.
+- **`--input-by-line` line mode** — one newline = one request.
+  Internal `. ! ?` are treated as prosody, not as hard boundaries,
+  so "Hello there. How are you today?" becomes a single T3 run
+  instead of two runs with a 150 ms gap between them.  Saves the
+  inter-sentence restart cost and produces more natural delivery
+  when the upstream emits complete thoughts per line.
+- **T3 early-stop auto-retry was also hit in live mode.**  The
+  batch pipeline already replays segments when T3 samples
+  `stop_speech_token` suspiciously early (symptom: a cloned voice
+  clips the first or last word of a sentence).  Lifted the same
+  `min_tokens = max(8, bpe_tokens * 5)`, three-attempt, keep-longest
+  guard into the live `synth_sentence`.
+- **Skip pure-punctuation input.**  With the various split
+  heuristics, it was possible to route a single `.` through T3 (on
+  a TTY: the user hits Enter with an empty buffer, punc_norm fills
+  in a period).  T3 then hallucinates ~1.4 s of speaker-biased audio
+  that can sound like a word from the previous utterance.  The live
+  path now drops any sentence whose punc-normalised form contains no
+  alphanumeric characters, with a `[skipped: no word characters]`
+  notice on TTY.
+- **Knob cleanup.**  Removed `--input-flush-ms` (idle-flush mid-buffer
+  was only useful when the terminator set was limited to `.!?` and
+  got obsoleted by `--input-by-line` + explicit `\n`) and
+  `--input-poll-ms` (hard-coded to 25 ms, well below perception).
+  One less thing to think about for users; one less thing to get
+  wrong.
+
+Commits: `00bfd7f` (fread→read fix), `189fe9d` (interactive stdin),
+`9e1b101` (T3 retry port), `dc0b5e1` (punctuation-only skip),
+`e0af5e9` (`--input-by-line`), `d843a59` / `cff89ae` (knob cleanup).
+
+### 3.18  `scripts/extract-voice.py` — automated voice-clone prep
+
+Every voice-cloning debug session ended the same way: probe the
+source with `ffprobe`, scan with `silencedetect`, eyeball the output
+for the longest clean region, pick an `-ss`/`-t`, iterate on the
+ffmpeg filter chain until the clone stopped sounding wrong, optionally
+bake the `.npy` profile.  Scripted the whole thing.
+
+`./scripts/extract-voice.py INPUT [--name NAME] [--target SEC] [--bake]`
+does:
+
+1. `ffprobe` for duration, codec, bitrate.
+2. `ffmpeg silencedetect=noise=-30dB:d=0.3` to split into speech
+   regions.
+3. Rank candidate windows: prefer a continuous slice from the middle
+   of the longest region (speaker is warmed up, hasn't started
+   wrapping up), fall back to concatenating the two best short
+   blocks when no single block is ≥ target.
+4. Pick a codec-aware filter chain:
+   - **clean** (WAV / FLAC / ≥ 96 kbps AAC / ≥ 128 kbps MP3):
+     `highpass=f=60, alimiter=limit=0.85:level=disabled`.
+     Trusts the source.
+   - **lossy** (Opus / Vorbis at any bitrate, or low-bitrate
+     AAC / MP3): `highpass=f=60, afftdn=nr=6:nt=w,
+     equalizer=f=200:w=150:g=-1, equalizer=f=3200:w=2200:g=2.5,
+     equalizer=f=7500:w=2500:g=3, loudnorm=I=-18:TP=-2:LRA=8,
+     alimiter=limit=0.85:level=disabled`.  Denoises the codec hiss,
+     puts a mild dip at 200 Hz to unmuddy, boosts presence around
+     2–4 kHz and air around 6–9 kHz to replace some of the content
+     Opus' brick-wall low-pass throws away above ~8 kHz, loudness-
+     normalises so the speaker embedding doesn't drift on the
+     shouted-vs-whispered axis.
+5. Emit `voices/<name>.wav` at 24 kHz mono s16le.
+6. Optionally call `./build/chatterbox --save-voice` to bake the
+   five `.npy` tensors.
+
+Commit: `84d2189`.
+
+The lossy chain is what took an 18 kbps Opus voice note from "clone
+sounds wrong" to "sounds like the speaker" during the Marco debug
+session.  On clean-source material the minimal chain is usually
+sufficient and the EQ boosts would only add a mild bright tint.
+
 ### Cross-backend summary
 
 Same 10 s sentence, seed 42, `gen_RTF` is inference-only (excludes

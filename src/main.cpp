@@ -19,11 +19,16 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <map>
@@ -365,7 +370,17 @@ bool compute_embedding_native(const std::string & wav_path,
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
 
-    if (!campplus_embed(fbank, T, w, backend, out_emb)) return false;
+    // Force the scalar C++ CAMPPlus path for now.  The ggml-graph variant
+    // (campplus_embed_ggml) produces an antipodal embedding vs the
+    // scalar/Python reference on real voice inputs (cos_sim ~ -0.19 vs
+    // Python, while the scalar path matches at ~0.9999).  The bug is in
+    // the graph construction and isn't exercised by test-campplus because
+    // that harness passes backend=nullptr too.  CAMPPlus only runs once
+    // per voice-bake, ~500 ms on CPU, so the ggml speed-up isn't critical
+    // for user-visible latency — we pay a small one-time cost in exchange
+    // for a correct speaker embedding.
+    (void)backend;
+    if (!campplus_embed(fbank, T, w, /*backend=*/nullptr, out_emb)) return false;
     if (verbose) fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
             out_emb.size(), T);
     return true;
@@ -416,6 +431,9 @@ bool compute_speech_tokens_native(const std::string & wav_path,
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // Save the five voice-conditioning tensors to a directory as .npy so later
 // runs can reuse them via --ref-dir (no --reference-audio needed), skipping
@@ -554,6 +572,21 @@ struct cli_params {
     //                           seams, in ms.  Default 30.
     int32_t max_sentence_chars        = 180;
     int32_t crossfade_ms              = 30;
+
+    // Incremental streaming input.  When --input-file PATH is set, the binary
+    // opens PATH for reading and follows it with tail -f semantics: as soon as
+    // a complete sentence (ending in . ! ? or \n) has been read, it's
+    // tokenised, fed to T3, and the resulting speech tokens are streamed
+    // through S3Gen + HiFT to stdout.  Intended for pairing with an upstream
+    // process (a streaming LLM, a live transcription, a human typing, …) that
+    // writes text to the file while we synthesise it.
+    //
+    // Requires --s3gen-gguf, --stream-chunk-tokens > 0, --out -.
+    // Exclusive with --text / --tokens-file.
+    std::string input_file;
+    std::string input_eof_marker;        // optional; stops reading when seen
+    bool        input_by_line    = false; // one request per \n; don't split
+                                          // on . ! ? within a line
 };
 
 static void print_usage(const char * argv0) {
@@ -617,6 +650,28 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --stream-cfm-steps N    CFM Euler step count per chunk.  Python uses 2 for\n");
     fprintf(stderr, "                          meanflow; 1 halves CFM cost.  (default: 0 = 2)\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "  --input-file PATH       Stream text from PATH as another process writes to it.\n");
+    fprintf(stderr, "                          tail -f semantics: each complete sentence (ending in\n");
+    fprintf(stderr, "                          . ! ? or newline) is tokenised and synthesised the\n");
+    fprintf(stderr, "                          moment it arrives; audio streams chunk-by-chunk to\n");
+    fprintf(stderr, "                          stdout as raw s16le @ 24 kHz mono.  Use '-' to read\n");
+    fprintf(stderr, "                          from stdin instead of a file; on a TTY this gives an\n");
+    fprintf(stderr, "                          interactive prompt where each Enter-terminated line\n");
+    fprintf(stderr, "                          is spoken immediately (Ctrl-D exits).  Runs until\n");
+    fprintf(stderr, "                          SIGINT or stdin EOF / --input-eof-marker.  Requires\n");
+    fprintf(stderr, "                          --s3gen-gguf, --stream-chunk-tokens > 0, --out -.\n");
+    fprintf(stderr, "                          Exclusive with --text / --tokens-file.\n");
+    fprintf(stderr, "  --input-eof-marker STR  When this string is seen in the input, flush any\n");
+    fprintf(stderr, "                          preceding text, synthesise it, and exit cleanly.\n");
+    fprintf(stderr, "                          (default: none = run until SIGINT)\n");
+    fprintf(stderr, "  --input-by-line         Treat one newline-terminated line as one request.\n");
+    fprintf(stderr, "                          . ! ? inside a line no longer split it into multiple\n");
+    fprintf(stderr, "                          synthesis runs (and the 150 ms gap that goes with them);\n");
+    fprintf(stderr, "                          the full line is sent to T3 as a single utterance.\n");
+    fprintf(stderr, "                          Ideal when each upstream message is one 'request' and\n");
+    fprintf(stderr, "                          internal punctuation is meant as prosody, not as a\n");
+    fprintf(stderr, "                          hard boundary.\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "  --max-sentence-chars N  Split --text into segments of at most N chars, running\n");
     fprintf(stderr, "                          T3+S3Gen+HiFT per segment and concatenating the PCM with\n");
     fprintf(stderr, "                          a raised-cosine crossfade.  Works around Chatterbox Turbo's\n");
@@ -633,6 +688,38 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
             if (i + 1 >= argc) { fprintf(stderr, "error: %s requires an argument\n", flag); return nullptr; }
             return argv[++i];
         };
+        // Safe numeric parsers: turn std::stoi / std::stof "no conversion"
+        // exceptions into a user-friendly error + clean exit.  Catches the
+        // common mistake of a flag being followed by *another flag* because
+        // the intended value was forgotten (e.g. `--n-gpu-layers --out ...`).
+        auto parse_int = [&](const char * flag, int32_t & out) -> bool {
+            auto v = next(flag);
+            if (!v) return false;
+            try {
+                size_t pos = 0;
+                long long n = std::stoll(v, &pos);
+                if (pos != std::strlen(v)) throw std::invalid_argument("trailing garbage");
+                out = (int32_t) n;
+                return true;
+            } catch (const std::exception & e) {
+                fprintf(stderr, "error: %s expects an integer value, got '%s' (%s)\n", flag, v, e.what());
+                return false;
+            }
+        };
+        auto parse_float = [&](const char * flag, float & out) -> bool {
+            auto v = next(flag);
+            if (!v) return false;
+            try {
+                size_t pos = 0;
+                float f = std::stof(v, &pos);
+                if (pos != std::strlen(v)) throw std::invalid_argument("trailing garbage");
+                out = f;
+                return true;
+            } catch (const std::exception & e) {
+                fprintf(stderr, "error: %s expects a number, got '%s' (%s)\n", flag, v, e.what());
+                return false;
+            }
+        };
 
         if      (arg == "--model")          { auto v = next("--model");          if (!v) return false; params.model = v; }
         else if (arg == "--text")           { auto v = next("--text");           if (!v) return false; params.text = v; }
@@ -645,28 +732,55 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--save-voice")     { auto v = next("--save-voice");     if (!v) return false; params.save_voice_dir = v; }
         else if (arg == "--debug")          { params.debug = true; }
         else if (arg == "--verbose" || arg == "-v") { params.verbose = true; }
-        else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
-        else if (arg == "--threads")        { auto v = next("--threads");        if (!v) return false; params.n_threads = std::stoi(v); }
-        else if (arg == "--n-predict")      { auto v = next("--n-predict");      if (!v) return false; params.n_predict = std::stoi(v); }
-        else if (arg == "--context")        { auto v = next("--context");        if (!v) return false; params.n_ctx = std::stoi(v); }
-        else if (arg == "--n-gpu-layers")   { auto v = next("--n-gpu-layers");   if (!v) return false; params.n_gpu_layers = std::stoi(v); }
-        else if (arg == "--top-k")          { auto v = next("--top-k");          if (!v) return false; params.top_k = std::stoi(v); }
-        else if (arg == "--top-p")          { auto v = next("--top-p");          if (!v) return false; params.top_p = std::stof(v); }
-        else if (arg == "--temp")           { auto v = next("--temp");           if (!v) return false; params.temp = std::stof(v); }
-        else if (arg == "--repeat-penalty") { auto v = next("--repeat-penalty"); if (!v) return false; params.repeat_penalty = std::stof(v); }
+        else if (arg == "--seed")           { if (!parse_int  ("--seed",           params.seed))           return false; }
+        else if (arg == "--threads")        { if (!parse_int  ("--threads",        params.n_threads))      return false; }
+        else if (arg == "--n-predict")      { if (!parse_int  ("--n-predict",      params.n_predict))      return false; }
+        else if (arg == "--context")        { if (!parse_int  ("--context",        params.n_ctx))          return false; }
+        else if (arg == "--n-gpu-layers")   { if (!parse_int  ("--n-gpu-layers",   params.n_gpu_layers))   return false; }
+        else if (arg == "--top-k")          { if (!parse_int  ("--top-k",          params.top_k))          return false; }
+        else if (arg == "--top-p")          { if (!parse_float("--top-p",          params.top_p))          return false; }
+        else if (arg == "--temp")           { if (!parse_float("--temp",           params.temp))           return false; }
+        else if (arg == "--repeat-penalty") { if (!parse_float("--repeat-penalty", params.repeat_penalty)) return false; }
         else if (arg == "--language")       { auto v = next("--language");       if (!v) return false; params.language = v; }
-        else if (arg == "--cfg-weight")     { auto v = next("--cfg-weight");     if (!v) return false; params.cfg_weight = std::stof(v); }
-        else if (arg == "--min-p")          { auto v = next("--min-p");          if (!v) return false; params.min_p = std::stof(v); }
-        else if (arg == "--exaggeration")   { auto v = next("--exaggeration");   if (!v) return false; params.exaggeration = std::stof(v); }
-        else if (arg == "--max-sentence-chars") { auto v = next("--max-sentence-chars"); if (!v) return false; params.max_sentence_chars = std::stoi(v); }
+        else if (arg == "--cfg-weight")     { if (!parse_float("--cfg-weight",     params.cfg_weight))     return false; }
+        else if (arg == "--min-p")          { if (!parse_float("--min-p",          params.min_p))          return false; }
+        else if (arg == "--exaggeration")   { if (!parse_float("--exaggeration",   params.exaggeration))   return false; }
+        else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
-        else if (arg == "--crossfade-ms")   { auto v = next("--crossfade-ms");   if (!v) return false; params.crossfade_ms = std::stoi(v); }
-        else if (arg == "--stream-chunk-tokens") { auto v = next("--stream-chunk-tokens"); if (!v) return false; params.stream_chunk_tokens = std::stoi(v); }
-        else if (arg == "--stream-first-chunk-tokens") { auto v = next("--stream-first-chunk-tokens"); if (!v) return false; params.stream_first_chunk_tokens = std::stoi(v); }
-        else if (arg == "--stream-cfm-steps") { auto v = next("--stream-cfm-steps"); if (!v) return false; params.stream_cfm_steps = std::stoi(v); }
+        else if (arg == "--crossfade-ms")   { if (!parse_int("--crossfade-ms",   params.crossfade_ms))   return false; }
+        else if (arg == "--stream-chunk-tokens")       { if (!parse_int("--stream-chunk-tokens",       params.stream_chunk_tokens))       return false; }
+        else if (arg == "--stream-first-chunk-tokens") { if (!parse_int("--stream-first-chunk-tokens", params.stream_first_chunk_tokens)) return false; }
+        else if (arg == "--stream-cfm-steps")          { if (!parse_int("--stream-cfm-steps",          params.stream_cfm_steps))          return false; }
+        else if (arg == "--input-file")       { auto v = next("--input-file");       if (!v) return false; params.input_file = v; }
+        else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
+        else if (arg == "--input-by-line")    { params.input_by_line = true; }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
-        else { fprintf(stderr, "error: unknown argument: %s\n", arg.c_str()); return false; }
+        else {
+            // Surface two common shell typos that would otherwise produce
+            // cryptic messages: (a) an argument that's entirely whitespace
+            // — symptom of `\<space>` at end of a continuation line, the
+            // backslash escapes the space instead of the newline; (b) a
+            // leading backslash on the arg itself, symptom of the same
+            // thing on the previous line.
+            bool all_ws = !arg.empty();
+            for (char c : arg) if (!std::isspace((unsigned char)c)) { all_ws = false; break; }
+            if (all_ws) {
+                fprintf(stderr, "error: empty / whitespace-only argument at position %d. "
+                                "This usually means you have a trailing space after '\\' at the "
+                                "end of a continuation line — remove it so the shell treats the "
+                                "next newline as the line break.\n", i);
+            } else if (!arg.empty() && arg[0] == '\\') {
+                fprintf(stderr, "error: argument starts with a backslash: %s\n  "
+                                "You probably have a trailing space after '\\' on the *previous* "
+                                "line, which escaped the space instead of the newline.  Remove "
+                                "the trailing space so the next line is treated as a continuation.\n",
+                        arg.c_str());
+            } else {
+                fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
+            }
+            return false;
+        }
     }
     if (params.dump_tokens_only) {
         if (params.text.empty()) {
@@ -688,10 +802,24 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
                         "or --save-voice + --reference-audio to bake only)\n");
         return false;
     }
-    if (!bake_only && params.text.empty() && params.tokens_file.empty()) {
-        fprintf(stderr, "error: either --text or --tokens-file is required (or --save-voice + "
-                        "--reference-audio to bake a voice profile without synthesising)\n");
+    if (!bake_only && params.text.empty() && params.tokens_file.empty() && params.input_file.empty()) {
+        fprintf(stderr, "error: one of --text / --tokens-file / --input-file is required "
+                        "(or --save-voice + --reference-audio to bake a voice profile without synthesising)\n");
         return false;
+    }
+    if (!params.input_file.empty()) {
+        if (params.s3gen_gguf.empty()) {
+            fprintf(stderr, "error: --input-file requires --s3gen-gguf\n"); return false;
+        }
+        if (params.stream_chunk_tokens <= 0) {
+            fprintf(stderr, "error: --input-file requires --stream-chunk-tokens > 0\n"); return false;
+        }
+        if (params.out_wav != "-") {
+            fprintf(stderr, "error: --input-file requires --out - (stream raw PCM to stdout)\n"); return false;
+        }
+        if (!params.text.empty() || !params.tokens_file.empty()) {
+            fprintf(stderr, "error: --input-file is mutually exclusive with --text / --tokens-file\n"); return false;
+        }
     }
     if (!params.s3gen_gguf.empty() && !bake_only && params.out_wav.empty()) {
         fprintf(stderr, "error: --s3gen-gguf requires --out PATH.wav\n"); return false;
@@ -1288,7 +1416,14 @@ void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*ud*/) {
 int qvac_tts_cli_main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
-    if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }
+    if (!parse_args(argc, argv, params)) {
+        // Don't dump the full usage here — parse_args already printed the
+        // specific error (missing / malformed value, unknown flag).  Dumping
+        // ~90 lines of option descriptions below it just pushes the actual
+        // message off-screen.  Point users at --help if they want it.
+        fprintf(stderr, "Run `%s --help` for the full list of options.\n", argv[0]);
+        return 1;
+    }
 
     // Apply the log filter BEFORE any ggml_backend_*_init() runs, otherwise
     // Metal / Vulkan device-init messages leak out.
@@ -1562,6 +1697,559 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                 "%s: no T3 override; keeping built-in T3 voice\n", __func__);
         }
 
+        // -----------------------------------------------------------------
+        // --input-file: incremental / tail -f streaming synthesis
+        // -----------------------------------------------------------------
+        //
+        // When --input-file is set we bypass the static --text pipeline and
+        // enter a loop that:
+        //
+        //   1. fread()s whatever bytes are currently available in the file,
+        //   2. scans for complete sentences (ending in . ! ? or newline),
+        //   3. tokenises and synthesises each sentence the moment it arrives,
+        //      streaming the resulting PCM to stdout chunk-by-chunk, and
+        //   4. sleeps briefly and polls again when the file has no new data.
+        //
+        // The file is expected to be written by another process. Termination:
+        //   - SIGINT / SIGTERM (flag is polled between reads and chunks)
+        //   - `--input-eof-marker STR` seen in the input (any text before it
+        //     is flushed and synthesised, then we exit cleanly).
+        //
+        // Because the binary doesn't have daemon/server-mode plumbing, every
+        // sentence reuses the same in-process T3 + S3Gen+HiFT state: no model
+        // reloads, no warm-up between sentences. First-audio latency for a
+        // new sentence ≈ T3 prompt eval (~100-300 ms with Metal+q8_0) +
+        // first-chunk S3Gen (~250 ms) ≈ 400-550 ms.
+        if (!params.input_file.empty()) {
+            // Wait for the S3Gen background preload up-front so that any
+            // early-return below (fopen failure, missing tokenizer, ...)
+            // doesn't leave a joinable std::thread that std::terminate()s on
+            // destruction.
+            if (s3gen_preload_thread.joinable()) s3gen_preload_thread.join();
+
+            // Free all T3-owned GPU resources before an early return.  Without
+            // this Metal's static device destructor asserts at process exit
+            // ("rsets->data count != 0") because the residency sets attached
+            // to model.buffer_w / buffer_kv are still live when the dylib
+            // tears the device down.  (S3Gen's cache registers its own
+            // atexit hook; T3 has no such hook, main() is its owner.)
+            auto free_t3 = [&]() {
+                ggml_backend_buffer_free(model.buffer_w);
+                ggml_backend_buffer_free(model.buffer_kv);
+                if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
+                ggml_backend_free(model.backend);
+                ggml_free(model.ctx_w);
+                ggml_free(model.ctx_kv);
+                if (model.ctx_override) ggml_free(model.ctx_override);
+                model.buffer_w = nullptr;
+                model.buffer_kv = nullptr;
+                model.buffer_override = nullptr;
+                model.backend = nullptr;
+                model.ctx_w = nullptr;
+                model.ctx_kv = nullptr;
+                model.ctx_override = nullptr;
+            };
+
+            if (model.tok_tokens.empty()) {
+                fprintf(stderr,
+                    "error: GGUF has no embedded tokenizer; --input-file requires one\n");
+                free_t3();
+                return 1;
+            }
+            gpt2_bpe bpe_live;
+            bpe_live.load_from_arrays(model.tok_tokens, model.tok_merges);
+
+            // Use open()/read() on a plain fd rather than fopen()/fread()
+            // because macOS/Linux stdio keeps its own readahead buffer; once
+            // a FILE* hits EOF the buffer can happily keep returning 0 for
+            // many subsequent reads even after the writer appended new
+            // bytes and we called clearerr().  read() always asks the
+            // kernel for the current state, which is what `tail -f`
+            // semantics require.
+            //
+            // Special case: `--input-file -` means "read from stdin", so the
+            // user can run a single process, type (or pipe) text into the
+            // terminal, and hear it spoken back.  We intentionally do not
+            // open() "/dev/stdin" here because that gets a fresh fd whose
+            // initial offset is 0 on some systems, which re-reads prior
+            // bytes of the terminal session on TTYs.
+            int in_fd;
+            const bool input_from_stdin = (params.input_file == "-");
+            if (input_from_stdin) {
+                in_fd = STDIN_FILENO;
+            } else {
+                in_fd = open(params.input_file.c_str(), O_RDONLY);
+                if (in_fd < 0) {
+                    fprintf(stderr, "error: cannot open --input-file '%s': %s\n",
+                            params.input_file.c_str(), std::strerror(errno));
+                    free_t3();
+                    return 1;
+                }
+            }
+            const bool stdin_is_tty = input_from_stdin && isatty(STDIN_FILENO) != 0;
+
+            // S3Gen opts: same setup as the regular streaming branch below.
+            s3gen_synthesize_opts opts;
+            opts.s3gen_gguf_path = params.s3gen_gguf;
+            opts.out_wav_path    = params.out_wav;     // "-" → stdout
+            opts.ref_dir         = params.ref_dir;
+            opts.seed            = params.seed;
+            opts.n_threads       = params.n_threads;
+            opts.debug           = params.debug;
+            opts.verbose         = params.verbose;
+            opts.n_gpu_layers    = params.n_gpu_layers;
+            if (!params.reference_audio.empty()) {
+                if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
+                                                opts.prompt_feat_override,
+                                                opts.prompt_feat_rows_override,
+                                                params.verbose))
+                    throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
+                (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
+                                               opts.embedding_override,
+                                               /*backend=*/model.backend, params.verbose);
+                if (!prompt_token_from_ref.empty()) {
+                    opts.prompt_token_override = std::move(prompt_token_from_ref);
+                }
+                if (!params.save_voice_dir.empty()) {
+                    save_voice_profile(params.save_voice_dir,
+                                       se_data, ct_data,
+                                       opts.embedding_override,
+                                       opts.prompt_token_override,
+                                       opts.prompt_feat_override,
+                                       opts.prompt_feat_rows_override);
+                }
+            }
+
+            // Ctrl-C / SIGTERM: set a flag the read + synth loops poll.
+            static std::atomic<bool> live_stop{false};
+            {
+                struct sigaction sa;
+                std::memset(&sa, 0, sizeof(sa));
+                sa.sa_handler = [](int){ live_stop.store(true); };
+                sigemptyset(&sa.sa_mask);
+                sigaction(SIGINT,  &sa, nullptr);
+                sigaction(SIGTERM, &sa, nullptr);
+            }
+
+            ggml_gallocr_t allocr_live = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(model.backend));
+            std::mt19937 rng_live(params.seed);
+
+            constexpr int S3GEN_SIL = 4299;
+            const int sr            = opts.sr ? opts.sr : 24000;
+            const int chunk_n       = params.stream_chunk_tokens;
+            const int first_chunk_n = params.stream_first_chunk_tokens > 0
+                                    ? params.stream_first_chunk_tokens
+                                    : chunk_n;
+
+            std::string       pending;
+            std::vector<char> read_buf(4096);
+            bool   saw_eof_marker          = false;
+            size_t segments_done           = 0;
+            size_t t3_tokens_total_live    = 0;
+            int64_t t3_total_ms_live       = 0;
+            double  first_audio_t_ms       = -1.0;
+            const double live_t0_ms        = 1e-3 * ggml_time_us();
+
+            const char * stop_hint =
+                stdin_is_tty
+                    ? (params.input_by_line
+                          ? "type a request + Enter (Ctrl-D to exit)"
+                          : "type a sentence + Enter (Ctrl-D to exit)")
+                    : (params.input_eof_marker.empty()
+                          ? "Ctrl-C to stop"
+                          : "stops at eof-marker or Ctrl-C");
+            const char * src_label =
+                input_from_stdin ? "<stdin>" : params.input_file.c_str();
+            const char * mode_label = params.input_by_line ? ", line-mode" : "";
+            fprintf(stderr, "\n=== live input: %s (%s%s) ===\n",
+                    src_label, stop_hint, mode_label);
+            if (stdin_is_tty) {
+                // Prompt lives on stderr so it doesn't collide with the
+                // raw-PCM stream on stdout.
+                fprintf(stderr, "> ");
+                fflush(stderr);
+            }
+
+            auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
+
+            // Pop the next complete sentence out of `pending`. Returns false
+            // if no terminator has been seen yet. When force_final is true we
+            // return whatever non-empty tail remains (used for the final
+            // flush after eof-marker / SIGINT).
+            auto pop_sentence = [&](std::string & out, bool force_final) -> bool {
+                if (pending.empty()) return false;
+                for (size_t i = 0; i < pending.size(); ++i) {
+                    char c = pending[i];
+                    // --input-by-line: only a literal newline ends a
+                    // request, so internal . ! ? stay inside the same
+                    // utterance and T3 gets the whole thing as a single
+                    // prompt (no mid-line restart + 150 ms gap).
+                    if (params.input_by_line) {
+                        if (c != '\n') continue;
+                        size_t j = i + 1;
+                        while (j < pending.size() && is_ws((unsigned char)pending[j])) ++j;
+                        out.assign(pending, 0, j);
+                        pending.erase(0, j);
+                        return true;
+                    }
+                    if (c != '.' && c != '!' && c != '?' && c != '\n') continue;
+                    const bool at_end = (i + 1 == pending.size());
+                    const unsigned char nx =
+                        at_end ? 0 : (unsigned char)pending[i + 1];
+                    const bool nx_ws     = !at_end && is_ws(nx);
+                    // Writers that pack sentences back-to-back without a
+                    // space after the terminator (e.g. "Hello.World." from
+                    // an LLM that forgot punctuation spacing) would
+                    // otherwise bundle everything into one utterance.
+                    // Accept "<.!?> + <uppercase letter>" as a sentence
+                    // break too.
+                    const bool nx_upper  = !at_end && nx >= 'A' && nx <= 'Z';
+                    if (c == '\n' || at_end || nx_ws || nx_upper) {
+                        size_t j = i + 1;
+                        while (j < pending.size() && is_ws((unsigned char)pending[j])) ++j;
+                        out.assign(pending, 0, j);
+                        pending.erase(0, j);
+                        return true;
+                    }
+                }
+                if (force_final) {
+                    out = std::move(pending);
+                    pending.clear();
+                    return !out.empty();
+                }
+                // Force-flush when the buffer overruns max_sentence_chars * 2
+                // without any punctuation, so a writer streaming word soup
+                // (no periods) still gets audio out.
+                if (params.max_sentence_chars > 0 &&
+                    (int)pending.size() > params.max_sentence_chars * 2) {
+                    const size_t n = (size_t)params.max_sentence_chars;
+                    out.assign(pending, 0, n);
+                    pending.erase(0, n);
+                    return true;
+                }
+                return false;
+            };
+
+            // Synthesize one sentence end-to-end: T3 -> S3Gen chunked
+            // streaming -> stdout PCM. Returns non-zero to abort the loop.
+            auto synth_sentence = [&](const std::string & raw_sentence) -> int {
+                std::string normalized = gpt2_bpe::punc_norm(raw_sentence);
+                if (normalized.empty()) return 0;
+
+                // Reject inputs that are only punctuation / whitespace.
+                // Otherwise T3 happily hallucinates ~1-2 s of speaker-biased
+                // audio for e.g. the single token "." — which with a cloned
+                // voice can come out sounding like a word from the previous
+                // utterance (reported live: "i heard 'you?' in seg 3 audio
+                // where seg 3 was just '.'").  Nothing sensible comes out of
+                // such inputs, so just drop them and keep the prompt.
+                bool has_word_char = false;
+                for (unsigned char c : normalized) {
+                    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c >= 0x80 /* UTF-8 cont */) {
+                        has_word_char = true;
+                        break;
+                    }
+                }
+                if (!has_word_char) {
+                    if (stdin_is_tty) {
+                        fprintf(stderr, "[skipped: no word characters]\n");
+                    }
+                    return 0;
+                }
+
+                std::vector<int32_t> text_toks = bpe_live.tokenize(normalized);
+                if (text_toks.empty()) return 0;
+
+                {
+                    std::string preview = normalized;
+                    if (preview.size() > 80) preview = preview.substr(0, 77) + "...";
+                    fprintf(stderr, "\n[live seg %zu] %s\n",
+                            segments_done + 1, preview.c_str());
+                }
+
+                // --- T3: text tokens -> speech tokens ---
+                //
+                // Re-seed the RNG deterministically per sentence.  Otherwise
+                // `rng_live` carries state across sentences: after a couple of
+                // long (hundreds-of-tokens) sentences, the RNG is in a very
+                // different state than a fresh run, and that state can
+                // combine with --repeat-penalty to shift where T3 lands on
+                // its stop token.  Deterministic per-segment reseed makes
+                // each sentence's sampling independent of the history while
+                // keeping everything reproducible (seed + segment index).
+                rng_live.seed((uint32_t)params.seed + (uint32_t)segments_done);
+
+                const int64_t t3_t0 = ggml_time_us();
+
+                // Same early-stop / retry loop as batch mode's
+                // run_t3_for_segment.  T3 occasionally samples
+                // stop_speech_token way too soon when the speaker
+                // conditioning is out-of-distribution - most visible
+                // with cloned voices - which manifests at the waveform
+                // level as the first / last word of a sentence being
+                // dropped.  Replay with a different RNG stream up to 3
+                // times, keep the longest result.
+                const int min_tokens = std::max(8, (int)(text_toks.size() * 5));
+                constexpr int MAX_RETRIES = 3;
+                auto rng_snapshot = rng_live;
+
+                std::vector<int32_t> generated, best_generated;
+                for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
+                    rng_live = rng_snapshot;
+                    rng_live.discard((size_t)attempt * 1009);
+
+                    std::vector<float> logits;
+                    int prompt_len = 0;
+                    if (!eval_prompt(model, allocr_live, params.n_threads,
+                                     text_toks, logits, prompt_len))
+                        throw std::runtime_error("prompt eval failed");
+
+                    int n_past = prompt_len;
+                    generated.clear();
+                    generated.reserve(params.n_predict + 1);
+
+                    int32_t current = sample_next_token(logits, generated, params, rng_live);
+                    generated.push_back(current);
+
+                    bool stopped_by_stop_token = false;
+                    for (int i = 0; i < params.n_predict; ++i) {
+                        if (current == model.hparams.stop_speech_token) { stopped_by_stop_token = true; break; }
+                        if (n_past + 1 > model.hparams.n_ctx) {
+                            fprintf(stderr, "KV cache full\n"); break;
+                        }
+                        if (!eval_step(model, allocr_live, params.n_threads,
+                                       n_past, current, logits))
+                            throw std::runtime_error("step eval failed");
+                        ++n_past;
+                        current = sample_next_token(logits, generated, params, rng_live);
+                        generated.push_back(current);
+                    }
+
+                    if (!generated.empty() &&
+                        generated.back() == model.hparams.stop_speech_token)
+                        generated.pop_back();
+
+                    if (generated.size() > best_generated.size()) best_generated = generated;
+
+                    const bool plausible = (int)generated.size() >= min_tokens;
+                    if (!stopped_by_stop_token || plausible) {
+                        if (attempt > 0) {
+                            fprintf(stderr, "  [live seg %zu] recovered after %d retries (%zu tokens)\n",
+                                    segments_done + 1, attempt, generated.size());
+                        }
+                        break;
+                    }
+
+                    if (attempt < MAX_RETRIES) {
+                        fprintf(stderr, "  [live seg %zu] early-stop at %zu tokens "
+                                        "(expected >= %d for %zu BPE tokens); retrying %d/%d\n",
+                                segments_done + 1, generated.size(), min_tokens,
+                                text_toks.size(), attempt + 1, MAX_RETRIES);
+                    } else {
+                        fprintf(stderr, "  [live seg %zu] all %d retries produced short output; "
+                                        "keeping longest (%zu tokens)\n",
+                                segments_done + 1, MAX_RETRIES + 1, best_generated.size());
+                        generated = best_generated;
+                    }
+                }
+
+                t3_tokens_total_live += generated.size();
+                t3_total_ms_live     += (ggml_time_us() - t3_t0) / 1000;
+
+                // --- S3Gen + HiFT streaming (same boundary + cache logic
+                //     as the multi-segment streaming path below) ---
+                std::vector<int32_t> seg_toks = std::move(generated);
+                seg_toks.push_back(S3GEN_SIL);
+                seg_toks.push_back(S3GEN_SIL);
+                seg_toks.push_back(S3GEN_SIL);
+                const int total_n   = (int)seg_toks.size();
+                const int seg_first = (segments_done == 0) ? first_chunk_n : chunk_n;
+
+                std::vector<int> boundaries = {0};
+                int cursor = std::min(seg_first, total_n);
+                boundaries.push_back(cursor);
+                while (cursor < total_n) {
+                    cursor = std::min(cursor + chunk_n, total_n);
+                    boundaries.push_back(cursor);
+                }
+                const int min_tail = std::max(6, chunk_n / 3);
+                if (boundaries.size() >= 3) {
+                    const int tail_len = boundaries.back()
+                                       - boundaries[boundaries.size() - 2];
+                    if (tail_len < min_tail) boundaries.erase(boundaries.end() - 2);
+                }
+
+                std::vector<float> hift_cache_source;
+                int prev_mels_emitted = 0;
+
+                for (int k = 1; k < (int)boundaries.size(); ++k) {
+                    if (live_stop.load()) return 0;
+
+                    const int end    = boundaries[k];
+                    const bool is_last = (end == total_n);
+                    std::vector<int32_t> toks(seg_toks.begin(), seg_toks.begin() + end);
+
+                    s3gen_synthesize_opts copts = opts;
+                    std::vector<float> chunk_pcm;
+                    copts.out_wav_path             = "";
+                    copts.pcm_out                  = &chunk_pcm;
+                    copts.append_lookahead_silence = false;
+                    copts.finalize                 = is_last;
+                    copts.skip_mel_frames          = prev_mels_emitted;
+                    copts.apply_trim_fade          = (k == 1);
+                    copts.hift_cache_source        = hift_cache_source;
+                    std::vector<float> tail_out;
+                    copts.hift_source_tail_out     = &tail_out;
+                    copts.source_tail_samples      = 480;
+                    copts.cfm_steps                = params.stream_cfm_steps;
+
+                    int rc = s3gen_synthesize_to_wav(toks, copts);
+                    if (rc != 0) return rc;
+
+                    if (first_audio_t_ms < 0.0)
+                        first_audio_t_ms = 1e-3 * ggml_time_us() - live_t0_ms;
+
+                    stream_emit_pcm_stdout(chunk_pcm);
+                    hift_cache_source  = std::move(tail_out);
+                    prev_mels_emitted += (int)(chunk_pcm.size() / 480);
+                }
+
+                // Short silence between sentences — keeps the downstream
+                // player's buffer fed while we wait for the next sentence
+                // to arrive on the pipe.  Also reads as a natural pause.
+                if (params.crossfade_ms > 0) {
+                    const int gap_ms = std::max(150, 2 * params.crossfade_ms);
+                    std::vector<float> gap((size_t)(sr * gap_ms / 1000), 0.0f);
+                    stream_emit_pcm_stdout(gap);
+                }
+
+                ++segments_done;
+                return 0;
+            };
+
+            // --- Main tail -f loop ---
+            //
+            // INPUT_POLL_MS is the quiet-period sleep between read() attempts
+            // when the input file has no new bytes and between select()
+            // wake-ups on a TTY (so SIGINT is noticed without the user also
+            // pressing Enter).  25 ms gives ~25 ms first-byte latency for
+            // interactive appends, which is well below perception threshold
+            // (and the syscall is essentially free at that rate).
+            constexpr int INPUT_POLL_MS = 25;
+            int  loop_rc     = 0;
+            bool stdin_eof   = false;  // only meaningful when reading from stdin
+            // Re-prints the interactive prompt once per "ready for input"
+            // state (after start-up, and after each synthesised sentence
+            // when nothing is queued).
+            auto reprompt = [&]() {
+                if (stdin_is_tty && !stdin_eof && pending.empty() && !live_stop.load()) {
+                    fprintf(stderr, "> ");
+                    fflush(stderr);
+                }
+            };
+            while (!live_stop.load()) {
+                // For TTY stdin, read() blocks until the user types a line.
+                // Use select() with the poll timeout so SIGINT (which sets
+                // live_stop) is noticed promptly and the user doesn't need
+                // to also press Enter to exit.
+                if (stdin_is_tty) {
+                    fd_set rf; FD_ZERO(&rf); FD_SET(in_fd, &rf);
+                    struct timeval tv;
+                    tv.tv_sec  = 0;
+                    tv.tv_usec = INPUT_POLL_MS * 1000;
+                    int sv = select(in_fd + 1, &rf, nullptr, nullptr, &tv);
+                    if (sv <= 0) {
+                        if (live_stop.load()) break;
+                        continue;
+                    }
+                }
+                ssize_t r;
+                do {
+                    r = read(in_fd, read_buf.data(), read_buf.size());
+                    if (r < 0 && errno == EINTR && live_stop.load()) break;
+                } while (r < 0 && errno == EINTR);
+                const size_t n = (r > 0) ? (size_t)r : 0;
+                if (n > 0) {
+                    pending.append(read_buf.data(), n);
+                    if (!params.input_eof_marker.empty()) {
+                        const auto pos = pending.find(params.input_eof_marker);
+                        if (pos != std::string::npos) {
+                            pending.resize(pos);
+                            saw_eof_marker = true;
+                        }
+                    }
+                } else if (r == 0 && input_from_stdin) {
+                    // EOF on stdin: the user pressed Ctrl-D (TTY) or the
+                    // upstream pipe was closed.  Drain the buffer one
+                    // last time and exit.  For regular files r == 0 just
+                    // means "no new bytes appended yet", so we only
+                    // treat it as terminal when reading from stdin.
+                    stdin_eof = true;
+                }
+
+                // Drain every complete sentence currently in the buffer.
+                bool synthesised_any = false;
+                std::string sentence;
+                while (pop_sentence(sentence, /*force_final=*/false)) {
+                    loop_rc = synth_sentence(sentence);
+                    sentence.clear();
+                    synthesised_any = true;
+                    if (loop_rc != 0 || live_stop.load()) break;
+                }
+                if (loop_rc != 0) break;
+
+                if (saw_eof_marker || stdin_eof) {
+                    // Final flush: synthesise any non-terminated tail.
+                    std::string tail;
+                    if (pop_sentence(tail, /*force_final=*/true)) {
+                        loop_rc = synth_sentence(tail);
+                    }
+                    break;
+                }
+
+                if (synthesised_any) {
+                    reprompt();
+                }
+
+                if (n == 0) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(INPUT_POLL_MS));
+                }
+            }
+
+            // SIGINT with a non-empty buffer: flush what we have.
+            if (live_stop.load() && !pending.empty() && loop_rc == 0) {
+                std::string tail;
+                if (pop_sentence(tail, /*force_final=*/true)) {
+                    (void)synth_sentence(tail);
+                }
+            }
+            // On TTY stdin, leave the shell cursor on a fresh line so the
+            // post-run summary doesn't overwrite the last "> ".
+            if (stdin_is_tty) {
+                fprintf(stderr, "\n");
+            }
+
+            if (!input_from_stdin) {
+                close(in_fd);
+            }
+            const double total_ms = 1e-3 * ggml_time_us() - live_t0_ms;
+            fprintf(stderr,
+                    "\n=== live input done: %zu sentences, "
+                    "first-audio=%.1f ms, total=%.1f s ===\n",
+                    segments_done,
+                    first_audio_t_ms >= 0.0 ? first_audio_t_ms : 0.0,
+                    total_ms / 1000.0);
+            fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
+                    (long long)t3_total_ms_live, t3_tokens_total_live);
+
+            ggml_gallocr_free(allocr_live);
+            free_t3();
+            return loop_rc;
+        }
+
         // ----------- Segment planning & tokenization ------------------
         //
         // When --text is given and --max-sentence-chars > 0, split the
@@ -1698,61 +2386,98 @@ int qvac_tts_cli_main(int argc, char ** argv) {
 
         auto run_t3_for_segment = [&](size_t si) {
             const int64_t _t0 = ggml_time_us();
-            int n_past = 0;
-            std::vector<int32_t> generated;
-            generated.reserve(params.n_predict + 1);
 
+            chatterbox_sampling_params sp_mtl;
             if (is_mtl) {
-                chatterbox_sampling_params sp;
-                sp.top_k          = params.top_k;
-                sp.top_p          = params.top_p;
-                sp.temp           = params.temp;
-                sp.repeat_penalty = params.repeat_penalty;
-                sp.min_p          = params.min_p;
-                sp.cfg_weight     = params.cfg_weight;
-
-                std::vector<float> logits_c, logits_u;
-                int prompt_len = 0;
-                if (!eval_prompt_mtl(model, allocr, params.n_threads,
-                                     seg_text_tokens[si], params.exaggeration,
-                                     logits_c, logits_u, prompt_len))
-                    throw std::runtime_error("prompt eval failed");
-                n_past = prompt_len;
-
-                int32_t current = sample_next_token_mtl(logits_c, logits_u, generated, sp, rng);
-                generated.push_back(current);
-
-                for (int i = 0; i < params.n_predict; ++i) {
-                    if (current == model.hparams.stop_speech_token) break;
-                    if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
-                    if (!eval_step_mtl(model, allocr, params.n_threads, n_past, current,
-                                       logits_c, logits_u))
-                        throw std::runtime_error("step eval failed");
-                    ++n_past;
-                    current = sample_next_token_mtl(logits_c, logits_u, generated, sp, rng);
-                    generated.push_back(current);
-                }
-            } else {
-                std::vector<float> logits;
-                int prompt_len = 0;
-                if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
-                    throw std::runtime_error("prompt eval failed");
-                n_past = prompt_len;
-                int32_t current = sample_next_token(logits, generated, params, rng);
-                generated.push_back(current);
-                for (int i = 0; i < params.n_predict; ++i) {
-                    if (current == model.hparams.stop_speech_token) break;
-                    if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
-                    if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
-                        throw std::runtime_error("step eval failed");
-                    ++n_past;
-                    current = sample_next_token(logits, generated, params, rng);
-                    generated.push_back(current);
-                }
+                sp_mtl.top_k          = params.top_k;
+                sp_mtl.top_p          = params.top_p;
+                sp_mtl.temp           = params.temp;
+                sp_mtl.repeat_penalty = params.repeat_penalty;
+                sp_mtl.min_p          = params.min_p;
+                sp_mtl.cfg_weight     = params.cfg_weight;
             }
 
-            if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
-                generated.pop_back();
+            const int min_tokens = std::max(8, (int)(seg_text_tokens[si].size() * 5));
+            constexpr int MAX_RETRIES = 3;
+            auto rng_snapshot = rng;
+
+            std::vector<int32_t> generated, best_generated;
+            for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
+                rng = rng_snapshot;
+                rng.discard((size_t)attempt * 1009);
+
+                std::vector<float> logits;
+                std::vector<float> logits_c, logits_u;
+                int prompt_len = 0;
+                if (is_mtl) {
+                    if (!eval_prompt_mtl(model, allocr, params.n_threads,
+                                         seg_text_tokens[si], params.exaggeration,
+                                         logits_c, logits_u, prompt_len))
+                        throw std::runtime_error("prompt eval failed");
+                } else {
+                    if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
+                        throw std::runtime_error("prompt eval failed");
+                }
+
+                int n_past = prompt_len;
+                generated.clear();
+                generated.reserve(params.n_predict + 1);
+
+                int32_t current = is_mtl
+                    ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng)
+                    : sample_next_token(logits, generated, params, rng);
+                generated.push_back(current);
+
+                bool stopped_by_stop_token = false;
+                for (int i = 0; i < params.n_predict; ++i) {
+                    if (current == model.hparams.stop_speech_token) { stopped_by_stop_token = true; break; }
+                    if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
+                    bool step_ok;
+                    if (is_mtl) {
+                        step_ok = eval_step_mtl(model, allocr, params.n_threads, n_past, current,
+                                                logits_c, logits_u);
+                    } else {
+                        step_ok = eval_step(model, allocr, params.n_threads, n_past, current, logits);
+                    }
+                    if (!step_ok) throw std::runtime_error("step eval failed");
+                    ++n_past;
+                    current = is_mtl
+                        ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng)
+                        : sample_next_token(logits, generated, params, rng);
+                    generated.push_back(current);
+                }
+
+                if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
+                    generated.pop_back();
+
+                if (generated.size() > best_generated.size()) best_generated = generated;
+
+                // MTL (Llama tokenizer) has a very different speech-tokens-per-
+                // BPE-token ratio than turbo (GPT-2 BPE) — the 5x floor below
+                // was tuned for English turbo and spuriously trips on MTL,
+                // where forcing an RNG-shuffled retry drove T3 to run all the
+                // way to n_predict producing garbage.  Skip the retry for MTL.
+                const bool plausible = is_mtl || (int)generated.size() >= min_tokens;
+                if (!stopped_by_stop_token || plausible) {
+                    if (attempt > 0) {
+                        fprintf(stderr, "  [t3 segment %zu/%zu] recovered after %d retries (%zu tokens)\n",
+                                si + 1, N_SEG, attempt, generated.size());
+                    }
+                    break;
+                }
+
+                if (attempt < MAX_RETRIES) {
+                    fprintf(stderr, "  [t3 segment %zu/%zu] early-stop at %zu tokens "
+                                    "(expected >= %d for %zu BPE tokens); retrying %d/%d\n",
+                            si + 1, N_SEG, generated.size(), min_tokens,
+                            seg_text_tokens[si].size(), attempt + 1, MAX_RETRIES);
+                } else {
+                    fprintf(stderr, "  [t3 segment %zu/%zu] all %d retries produced short output; "
+                                    "keeping longest (%zu tokens)\n",
+                            si + 1, N_SEG, MAX_RETRIES + 1, best_generated.size());
+                    generated = best_generated;
+                }
+            }
 
             if (multi_seg) {
                 fprintf(stderr, "  [t3 segment %zu/%zu] %zu speech tokens\n",
@@ -1843,11 +2568,26 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                 }
             }
             if (params.stream_chunk_tokens <= 0 && !multi_seg) {
-                // Single-shot: let s3gen_synthesize_to_wav write the wav
-                // directly and print its own "Wrote ..." line.
+                // Single-shot.  Two output modes:
+                //   --out PATH  → s3gen_synthesize_to_wav writes the wav and
+                //                 prints its own "Wrote ..." line.
+                //   --out -     → capture PCM in-memory and emit raw s16le to
+                //                 stdout (so it can be piped into `play` /
+                //                 `ffplay` without streaming mode).
                 ensure_t3(0);
-                int rc = s3gen_synthesize_to_wav(seg_generated[0], opts);
-                if (rc != 0) return rc;
+                if (params.out_wav == "-") {
+                    std::vector<float> pcm;
+                    s3gen_synthesize_opts so = opts;
+                    so.out_wav_path = "";
+                    so.pcm_out      = &pcm;
+                    int rc = s3gen_synthesize_to_wav(seg_generated[0], so);
+                    if (rc != 0) return rc;
+                    stream_emit_pcm_stdout(pcm);
+                    fprintf(stderr, "Streamed to stdout (raw s16le @ 24 kHz mono)\n");
+                } else {
+                    int rc = s3gen_synthesize_to_wav(seg_generated[0], opts);
+                    if (rc != 0) return rc;
+                }
             } else if (params.stream_chunk_tokens <= 0) {
                 // Auto-split multi-segment batch mode: render each segment
                 // into in-memory PCM, concatenate with a raised-cosine
@@ -1873,8 +2613,13 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                         "\n=== auto-split: %zu segments, %.0f ms for %.0f ms audio (RTF=%.2f) ===\n",
                         N_SEG, seg_total_ms, audio_ms,
                         audio_ms > 0.0 ? seg_total_ms / audio_ms : 0.0);
-                stream_write_wav(params.out_wav, full_pcm, sr);
-                fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
+                if (params.out_wav == "-") {
+                    stream_emit_pcm_stdout(full_pcm);
+                    fprintf(stderr, "Streamed to stdout (raw s16le @ 24 kHz mono)\n");
+                } else {
+                    stream_write_wav(params.out_wav, full_pcm, sr);
+                    fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
+                }
             } else {
                 // Streaming synthesis.  Runs the chunked S3Gen+HiFT loop on
                 // each T3 segment.  Within a segment, `hift_cache_source`

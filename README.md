@@ -254,6 +254,74 @@ python scripts/dump-s3gen-reference.py \
   --seed 42 --n-predict 64 --device cpu
 ```
 
+### Optional: quantize the models (smaller + faster)
+
+Both GGUFs can be quantized to `Q8_0` (near-lossless) or `Q4_0`
+(different CFM sample but same subjective quality, smaller).
+`llama-quantize` doesn't recognize the `chatterbox` / `chatterbox-s3gen`
+custom architectures, so we ship a small standalone rewriter that
+works on either model:
+
+```bash
+# T3
+python scripts/requantize-gguf.py \
+  models/chatterbox-t3-turbo.gguf \
+  models/t3-q8_0.gguf q8_0
+
+# S3Gen
+python scripts/requantize-gguf.py \
+  models/chatterbox-s3gen.gguf \
+  models/chatterbox-s3gen-q8_0.gguf q8_0
+```
+
+Swap `q8_0` → `q4_0` (or `q5_0`) for a more aggressive variant.  T3's
+original converter also accepts `--quant` if you prefer to quantize at
+conversion time instead of after.
+
+Measured on the QVAC paragraph (M3 Ultra, Metal, streaming mode
+`--stream-chunk-tokens 25 --max-sentence-chars 100`):
+
+| T3 / S3Gen                | total size | first-audio | total wall | cos sim¹ |
+|---------------------------|-----------:|------------:|-----------:|--------:|
+| F16 / F32 (baseline)      |  1 757 MB  |  1 604 ms   |   28.6 s   |  1.000  |
+| Q8_0 / F32                |  1 476 MB  |  1 451 ms   |   27.2 s   |   —     |
+| F16 / Q8_0                |  1 532 MB  |  1 646 ms   |   28.2 s   |  0.991  |
+| **Q8_0 / Q8_0**           | **1 251 MB** | **1 399 ms** | **26.4 s** | 0.991 |
+| **Q4_0 / Q4_0**           | **1 071 MB** | **1 510 ms** | **26.7 s** | 0.66²  |
+
+¹ Cosine similarity of the final waveform vs the F16/F32 baseline.
+
+² Q4_0 quantization shifts the CFM diffusion ODE's trajectory enough
+  to land on a *different sample* from the same noise seed.  Subjective
+  quality is essentially the same (in-distribution speech, correct
+  phonemes, stable voice); it's just a different legitimate sample
+  rather than a lower-fidelity version of the baseline.
+
+Using both Q8_0 variants cuts **~500 MB off disk**, drops first-audio
+latency **~13 %**, speeds total wall-clock **~8 %**, and produces
+audibly-identical output (cos-sim > 0.99 vs F32 reference waveform).
+Q4_0 trims another ~180 MB on top for roughly the same speed — best
+choice on memory-constrained targets (mobile, low-end CPUs) when you
+don't need per-seed reproducibility against the F32 baseline.
+
+Note: the S3Gen requantize script only compresses the 385 big 2-D
+matmul weights (encoder attention/MLPs + CFM projections + flow FFs).
+The 1 664 other tensors — biases, norms, spectral filterbanks, the
+input-embedding table, the 3-D convolution weights — remain at their
+source dtype to keep numerics clean.  That's why Q4_0 ends up only
+~15 % smaller than Q8_0 rather than 2× smaller; the bulk not covered
+by block quantization dominates.
+
+Pass the quantized GGUFs to `chatterbox` exactly like the defaults:
+
+```bash
+./build/chatterbox \
+  --model      models/t3-q8_0.gguf \
+  --s3gen-gguf models/chatterbox-s3gen-q8_0.gguf \
+  --text "Hello from the quantized port." \
+  --n-gpu-layers 99 --out out.wav
+```
+
 ## 3. Run — end-to-end text → wav
 
 The easiest way:
@@ -321,6 +389,31 @@ Advanced modes:
     this and fails fast; 10–15 s gives the best similarity).
   - Any sample rate, any PCM bit-depth (binary resamples + downmixes).
 
+  **Prep helper** — `scripts/extract-voice.py` automates the usual
+  chore of picking a good clip out of a messy recording (podcast,
+  WhatsApp voice note, `.mov` screen capture, etc.):
+
+  ```bash
+  # auto-detect codec, pick the best 10 s speech block, write voices/alice.wav:
+  ./scripts/extract-voice.py ~/Downloads/alice.m4a --name alice
+  # same, but also bake the .npy profile in one go:
+  ./scripts/extract-voice.py ~/Downloads/alice.m4a --name alice --bake
+  ```
+
+  It probes the file, runs `silencedetect` to find speech regions,
+  picks the longest clean 5–15 s block from the middle of the
+  recording (or concatenates the two best short blocks if no single
+  long block exists), then applies a codec-aware filter chain:
+
+  | source codec                         | chain applied                                                                 |
+  |--------------------------------------|-------------------------------------------------------------------------------|
+  | WAV / FLAC / ≥ 96 kbps AAC / ≥ 128 kbps MP3 | `highpass + alimiter` — minimal, trusts the source                      |
+  | Opus / Vorbis at any bitrate, low-bitrate AAC/MP3 | `highpass + afftdn + 3-band EQ + loudnorm + alimiter` — restores presence/air past the codec's brick-wall low-pass |
+
+  The lossy chain is what takes an 18 kbps Opus voice note from
+  "clone sounds wrong" to "clone sounds like the speaker".  See
+  `./scripts/extract-voice.py --help` for the full flag set.
+
   Loudness is normalised to **-27 LUFS** (ITU-R BS.1770-4 / EBU R 128)
   internally before preprocessing, so a quiet recording like a phone
   memo works as well as a studio track.  All five voice-conditioning
@@ -369,6 +462,65 @@ aplay  /tmp/out.wav         # Linux (alsa)
 ffplay /tmp/out.wav         # any OS with ffmpeg
 ```
 
+### Live / streaming input
+
+When you want a long-running process that keeps the model loaded and
+synthesises whatever text arrives as it arrives — e.g. the output of
+a streaming LLM, a live transcription, or just a human typing —
+use `--input-file`.  The binary `tail -f`'s the file, splits on
+sentence terminators (or `\n` in `--input-by-line` mode), and pipes
+raw PCM (s16le, 24 kHz, mono) to stdout chunk-by-chunk.
+
+```bash
+# Two-process demo: background writer appends sentences, chatterbox
+# tail-follows, sox plays in real time.
+./build/chatterbox \
+    --model       models/t3-q8_0.gguf \
+    --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
+    --ref-dir     voices/alice \
+    --input-file  ./speech.txt \
+    --input-by-line \
+    --stream-chunk-tokens 25 --stream-cfm-steps 2 \
+    --n-gpu-layers 99 \
+    --out -                     \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -   # sox(1)
+
+# Another process (LLM, transcriber, shell, etc.) writes here:
+echo "First request." >> speech.txt
+echo "Second request with, internal, punctuation." >> speech.txt
+```
+
+**Interactive mode on a TTY** — pass `--input-file -` to read from
+stdin.  On a terminal you get a `> ` prompt; each Enter-terminated
+line is spoken immediately, Ctrl-D exits:
+
+```bash
+./build/chatterbox \
+    --model       models/t3-q8_0.gguf \
+    --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
+    --ref-dir     voices/alice \
+    --input-file  - --input-by-line \
+    --stream-chunk-tokens 25 --stream-cfm-steps 2 \
+    --n-gpu-layers 99 \
+    --out -                     \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -
+```
+
+Relevant flags:
+
+| flag                          | effect                                                                                                               |
+|-------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| `--input-file PATH`           | Tail-follow `PATH`; `-` means read stdin (interactive on a TTY).                                                     |
+| `--input-by-line`             | One Enter-terminated line = one request.  `. ! ?` inside a line stay part of the same utterance (no mid-line restart). |
+| `--input-eof-marker STR`      | Exit cleanly after seeing `STR` anywhere in the input (useful for scripted pipelines).                                |
+| `--stream-chunk-tokens N`     | Speech-token chunk granularity for the S3Gen streaming loop.  25 is a good default.                                   |
+| `--stream-cfm-steps N`        | CFM Euler steps per chunk.  2 is the minimum the model was designed for; 4–5 gives crisper word endings on cloned voices. |
+| `--stream-first-chunk-tokens N` | Override the first chunk's size to minimise first-audio-out latency.                                                |
+
+The process keeps the T3 + S3Gen models warm across requests, so
+after the initial load (~150 ms), each request only pays T3 + S3Gen
+inference cost (well under real-time on any GPU backend).
+
 ### Useful flags
 
 - `--seed N` — change the RNG seed for the CFM initial noise and the SineGen
@@ -384,6 +536,11 @@ ffplay /tmp/out.wav         # any OS with ffmpeg
   reuse via `--ref-dir DIR`.
 - `--ref-dir DIR` — load previously-baked voice tensors (or a subset)
   from `DIR/*.npy`.
+- `--input-file PATH` — long-running mode; tail-follow `PATH` and
+  synthesise text as it arrives.  Pass `-` to read from stdin (see the
+  Live / streaming input section above).
+- `--input-by-line` — treat one newline as one complete request; `. ! ?`
+  inside a line stay part of the same utterance.
 - `--debug` (requires `--ref-dir`) — substitute Python-dumped reference
   values for the random bits so every stage can be bit-exactly compared
   to PyTorch.
