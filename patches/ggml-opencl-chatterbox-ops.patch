@@ -1,0 +1,634 @@
+diff --git a/include/ggml-opencl.h b/include/ggml-opencl.h
+index 6b617713..3f8312cf 100644
+--- a/include/ggml-opencl.h
++++ b/include/ggml-opencl.h
+@@ -11,6 +11,7 @@ extern "C" {
+ //
+ // backend API
+ //
++// May return NULL when no OpenCL device is available or the driver/context failed to init.
+ GGML_BACKEND_API ggml_backend_t ggml_backend_opencl_init(void);
+ GGML_BACKEND_API bool ggml_backend_is_opencl(ggml_backend_t backend);
+ 
+diff --git a/src/ggml-opencl/CMakeLists.txt b/src/ggml-opencl/CMakeLists.txt
+index 540942b1..7e802fa9 100644
+--- a/src/ggml-opencl/CMakeLists.txt
++++ b/src/ggml-opencl/CMakeLists.txt
+@@ -144,6 +144,7 @@ set(GGML_OPENCL_KERNELS
+     tsembd
+     upscale
+     tanh
++    sin
+     exp
+     expm1
+     softplus
+@@ -153,6 +154,8 @@ set(GGML_OPENCL_KERNELS
+     mul_mm_f16_f32_kq_kqv
+     conv2d
+     conv2d_f16_f32
++    conv_transpose_1d_f32
++    conv_transpose_1d_f16_f32
+     flash_attn_f32_f16
+     flash_attn_f16
+     flash_attn_f32
+diff --git a/src/ggml-opencl/ggml-opencl.cpp b/src/ggml-opencl/ggml-opencl.cpp
+index 6f3fc588..15d7a5dd 100644
+--- a/src/ggml-opencl/ggml-opencl.cpp
++++ b/src/ggml-opencl/ggml-opencl.cpp
+@@ -468,6 +468,8 @@ struct ggml_backend_opencl_context {
+     cl_program program_conv_2d_f16;
+     cl_program program_conv_2d_f32;
+     cl_program program_conv_2d_f16_f32;
++    cl_program program_conv_transpose_1d_f32;
++    cl_program program_conv_transpose_1d_f16_f32;
+     cl_program program_tsembd;
+     cl_program program_gemv_moe_mxfp4_f32, program_gemm_moe_mxfp4_f32;
+     cl_program program_mul_mv_id_q4_0_f32_8x_flat;
+@@ -560,6 +562,8 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_pad;
+     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
+     cl_kernel kernel_tanh_f16, kernel_tanh_f16_4, kernel_tanh_f16_nc;
++    cl_kernel kernel_sin_f32, kernel_sin_f32_4, kernel_sin_f32_nc;
++    cl_kernel kernel_sin_f16, kernel_sin_f16_4, kernel_sin_f16_nc;
+     cl_kernel kernel_neg_f32, kernel_neg_f32_4, kernel_neg_f32_nc;
+     cl_kernel kernel_neg_f16, kernel_neg_f16_4, kernel_neg_f16_nc;
+     cl_kernel kernel_exp_f32, kernel_exp_f32_4, kernel_exp_f32_nc;
+@@ -574,6 +578,8 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_conv_2d_f16;
+     cl_kernel kernel_conv_2d_f32;
+     cl_kernel kernel_conv_2d_f16_f32;
++    cl_kernel kernel_conv_transpose_1d_f32;
++    cl_kernel kernel_conv_transpose_1d_f16_f32;
+     cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
+     cl_kernel kernel_timestep_embedding;
+     cl_kernel kernel_gemv_moe_mxfp4_f32, kernel_gemm_moe_mxfp4_f32;
+@@ -2095,6 +2101,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
+         GGML_LOG_CONT(".");
+     }
+ 
++    // sin (GGML_OP_SIN)
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "sin.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("sin.cl");
++#endif
++        cl_program prog =
++            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
++        CL_CHECK((backend_ctx->kernel_sin_f32    = clCreateKernel(prog, "kernel_sin_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_f32_4  = clCreateKernel(prog, "kernel_sin_f32_4", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_f32_nc = clCreateKernel(prog, "kernel_sin_f32_nc", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_f16    = clCreateKernel(prog, "kernel_sin_f16", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_f16_4  = clCreateKernel(prog, "kernel_sin_f16_4", &err), err));
++        CL_CHECK((backend_ctx->kernel_sin_f16_nc = clCreateKernel(prog, "kernel_sin_f16_nc", &err), err));
++        CL_CHECK(clReleaseProgram(prog));
++        GGML_LOG_CONT(".");
++    }
++
+     // neg
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -2309,6 +2336,45 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
+                 }
+     }
+ 
++    // conv_transpose_1d
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src_f32 {
++            #include "conv_transpose_1d_f32.cl.h"
++        };
++        const std::string kernel_src_f16 {
++            #include "conv_transpose_1d_f16_f32.cl.h"
++        };
++#else
++        const std::string kernel_src_f32  = read_file("conv_transpose_1d_f32.cl");
++        const std::string kernel_src_f16 = read_file("conv_transpose_1d_f16_f32.cl");
++#endif
++        if (!kernel_src_f32.empty()) {
++            backend_ctx->program_conv_transpose_1d_f32 =
++                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32.c_str(), compile_opts);
++            CL_CHECK((backend_ctx->kernel_conv_transpose_1d_f32 = clCreateKernel(
++                          backend_ctx->program_conv_transpose_1d_f32, "kernel_conv_transpose_1d_f32", &err),
++                err));
++            GGML_LOG_CONT(".");
++        } else {
++            GGML_LOG_WARN("ggml_opencl: conv_transpose_1d_f32 kernel source not found. CONV_TRANSPOSE_1D (f32) will be unavailable.\n");
++            backend_ctx->program_conv_transpose_1d_f32 = nullptr;
++            backend_ctx->kernel_conv_transpose_1d_f32  = nullptr;
++        }
++        if (!kernel_src_f16.empty()) {
++            backend_ctx->program_conv_transpose_1d_f16_f32 = build_program_from_source(
++                backend_ctx->context, backend_ctx->device, kernel_src_f16.c_str(), compile_opts);
++            CL_CHECK((backend_ctx->kernel_conv_transpose_1d_f16_f32 = clCreateKernel(
++                          backend_ctx->program_conv_transpose_1d_f16_f32, "kernel_conv_transpose_1d_f16_f32", &err),
++                err));
++            GGML_LOG_CONT(".");
++        } else {
++            GGML_LOG_WARN("ggml_opencl: conv_transpose_1d_f16_f32 kernel source not found. CONV_TRANSPOSE_1D (f16) will be unavailable.\n");
++            backend_ctx->program_conv_transpose_1d_f16_f32 = nullptr;
++            backend_ctx->kernel_conv_transpose_1d_f16_f32  = nullptr;
++        }
++    }
++
+     // ssm_conv
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -3865,6 +3931,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+         case GGML_OP_SQRT:
+             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                     ggml_is_contiguous(op->src[0]);
++        case GGML_OP_SIN:
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
++                   (op->type == op->src[0]->type);
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(op)) {
+                 case GGML_UNARY_OP_GELU:
+@@ -3929,6 +3998,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                    (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
+                    (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
++        case GGML_OP_CONV_TRANSPOSE_1D:
++            if (ggml_get_op_params_i32(op, 1) != 0 || ggml_get_op_params_i32(op, 2) != 1) {
++                return false;
++            }
++            if (op->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
++                return false;
++            }
++            if (op->src[0]->type == GGML_TYPE_F32) {
++                return backend_ctx->kernel_conv_transpose_1d_f32 != nullptr;
++            }
++            if (op->src[0]->type == GGML_TYPE_F16) {
++                return backend_ctx->kernel_conv_transpose_1d_f16_f32 != nullptr;
++            }
++            return false;
+         case GGML_OP_SSM_CONV:
+             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+         case GGML_OP_CONCAT:
+@@ -4075,8 +4158,15 @@ static ggml_backend_i ggml_backend_opencl_i = {
+ };
+ 
+ ggml_backend_t ggml_backend_opencl_init(void) {
+-    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_opencl_reg(), 0);
++    ggml_backend_reg_t reg = ggml_backend_opencl_reg();
++    if (ggml_backend_reg_dev_count(reg) == 0) {
++        return nullptr;
++    }
++    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(dev);
++    if (!backend_ctx) {
++        return nullptr;
++    }
+ 
+     ggml_backend_t backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_opencl_guid(),
+@@ -5987,8 +6077,8 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t
+ 
+ static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
+     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
+-    /* .device_count     = */ ggml_backend_opencl_reg_device_count,
+-    /* .device_get       = */ ggml_backend_opencl_reg_device_get,
++    /* .get_device_count = */ ggml_backend_opencl_reg_device_count,
++    /* .get_device       = */ ggml_backend_opencl_reg_device_get,
+     /* .get_proc_address = */ NULL,
+ };
+ 
+@@ -8225,6 +8315,100 @@ static void ggml_cl_tanh(ggml_backend_t backend, const ggml_tensor * src0, const
+     }
+ }
+ 
++static void ggml_cl_sin(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++
++    UNUSED(src1);
++
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const int ne00 = src0->ne[0];
++    const int ne01 = src0->ne[1];
++    const int ne02 = src0->ne[2];
++    const int ne03 = src0->ne[3];
++
++    const cl_ulong nb00 = src0->nb[0];
++    const cl_ulong nb01 = src0->nb[1];
++    const cl_ulong nb02 = src0->nb[2];
++    const cl_ulong nb03 = src0->nb[3];
++
++    const cl_ulong nb0 = dst->nb[0];
++    const cl_ulong nb1 = dst->nb[1];
++    const cl_ulong nb2 = dst->nb[2];
++    const cl_ulong nb3 = dst->nb[3];
++
++    cl_kernel kernel;
++
++    if (ggml_is_contiguous(src0)) {
++        int n = ggml_nelements(dst);
++        if (n % 4 == 0) {
++            if (src0->type == GGML_TYPE_F32) {
++                kernel = backend_ctx->kernel_sin_f32_4;
++            } else {
++                kernel = backend_ctx->kernel_sin_f16_4;
++            }
++            n /= 4;
++        } else {
++            if (src0->type == GGML_TYPE_F32) {
++                kernel = backend_ctx->kernel_sin_f32;
++            } else {
++                kernel = backend_ctx->kernel_sin_f16;
++            }
++        }
++
++        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
++
++        size_t global_work_size[] = {(size_t) n, 1, 1};
++        size_t local_work_size[]  = {64, 1, 1};
++
++        size_t * local_work_size_ptr = local_work_size;
++        if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
++            local_work_size_ptr = nullptr;
++        }
++
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
++    } else {
++        if (src0->type == GGML_TYPE_F32) {
++            kernel = backend_ctx->kernel_sin_f32_nc;
++        } else {
++            kernel = backend_ctx->kernel_sin_f16_nc;
++        }
++
++        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &nb00));
++        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &nb01));
++        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb02));
++        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb03));
++        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb0));
++        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb1));
++        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb2));
++        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb3));
++
++        int nth = 64;
++
++        size_t global_work_size[] = {(size_t) ne01 * nth, (size_t) ne02, (size_t) ne03};
++        size_t local_work_size[]  = {(size_t) nth, 1, 1};
++
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    }
++}
++
+ static void ggml_cl_neg(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -9247,6 +9431,83 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
+     backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+ }
+ 
++static void ggml_cl_conv_transpose_1d(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == 0 && ggml_get_op_params_i32(dst, 2) == 1);
++
++    const int32_t s0 = ggml_get_op_params_i32(dst, 0);
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *) src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const cl_uint K     = (cl_uint) src0->ne[0];
++    const cl_uint Cout  = (cl_uint) src0->ne[1];
++    const cl_uint Cin   = (cl_uint) src0->ne[2];
++    const cl_uint L     = (cl_uint) src1->ne[0];
++    const cl_uint KL    = (cl_uint) dst->ne[0];
++    const cl_uint nbatch = (cl_uint) MAX((int64_t) 1, dst->ne[2]);
++
++    const cl_uint ts0 = (cl_uint) ggml_type_size(src0->type);
++    const cl_uint ts1 = (cl_uint) ggml_type_size(src1->type);
++    const cl_uint tsd = (cl_uint) ggml_type_size(dst->type);
++
++    const cl_uint k_nb0  = (cl_uint) (src0->nb[0] / ts0);
++    const cl_uint k_nb01 = (cl_uint) (src0->nb[1] / ts0);
++    const cl_uint k_nb02 = (cl_uint) (src0->nb[2] / ts0);
++    const cl_uint in_nb0 = (cl_uint) (src1->nb[0] / ts1);
++    const cl_uint in_nb1 = (cl_uint) (src1->nb[1] / ts1);
++    const cl_uint in_nb2 = (cl_uint) (src1->nb[2] / ts1);
++    const cl_uint d_nb0  = (cl_uint) (dst->nb[0] / tsd);
++    const cl_uint d_nb1  = (cl_uint) (dst->nb[1] / tsd);
++    const cl_uint d_nb2  = (cl_uint) (dst->nb[2] / tsd);
++
++    cl_kernel kernel = nullptr;
++    if (src0->type == GGML_TYPE_F32) {
++        kernel = backend_ctx->kernel_conv_transpose_1d_f32;
++    } else if (src0->type == GGML_TYPE_F16) {
++        kernel = backend_ctx->kernel_conv_transpose_1d_f16_f32;
++    } else {
++        GGML_ABORT("ggml_cl_conv_transpose_1d: unsupported src0 type");
++    }
++    GGML_ASSERT(kernel != nullptr);
++
++    cl_uint idx = 0;
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &k_nb0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &k_nb01));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &k_nb02));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &in_nb0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &in_nb1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &in_nb2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &d_nb0));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &d_nb1));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &d_nb2));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &K));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &Cout));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &Cin));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &L));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &KL));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &nbatch));
++    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int32_t),  &s0));
++
++    const size_t total     = (size_t) KL * (size_t) Cout * (size_t) nbatch;
++    size_t       global_work_size[] = { total, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, nullptr, dst);
++}
++
+ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
+@@ -13235,6 +13496,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_sqrt;
+             break;
++        case GGML_OP_SIN:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_sin;
++            break;
+         case GGML_OP_MEAN:
+             if (!any_on_device) {
+                 return false;
+@@ -13384,6 +13651,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_conv_2d;
+             break;
++        case GGML_OP_CONV_TRANSPOSE_1D:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_conv_transpose_1d;
++            break;
+         case GGML_OP_SSM_CONV:
+             if (!any_on_device) {
+                 return false;
+diff --git a/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl b/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl
+new file mode 100644
+index 00000000..376871f6
+--- /dev/null
++++ b/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl
+@@ -0,0 +1,50 @@
++// CONV_TRANSPOSE_1D — f16 kernel / f32 input / f32 out
++
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++#define CTD_IDX(ox, i1, ib, dnb0, dnb1, dnb2) \
++    ((ox) * (dnb0) + (i1) * (dnb1) + (ib) * (dnb2))
++
++kernel void kernel_conv_transpose_1d_f16_f32(
++    global void * p_k, ulong off_k,
++    global void * p_in, ulong off_in,
++    global void * p_d, ulong off_d,
++    uint k_nb0, uint k_nb01, uint k_nb02,
++    uint in_nb0, uint in_nb1, uint in_nb2,
++    uint d_nb0, uint d_nb1, uint d_nb2,
++    uint K, uint Cout, uint Cin, uint L, uint KL,
++    uint nbatch,
++    int s0
++) {
++    global const half * kA = (global const half *) ((global const char *) p_k + off_k);
++    global const float * bB = (global const float *) ((global const char *) p_in + off_in);
++    global float * dD = (global float *) ((global char *) p_d + off_d);
++
++    const uint total = KL * Cout * nbatch;
++    const uint gid = get_global_id(0);
++    if (gid >= total) {
++        return;
++    }
++
++    const uint ox  = gid % KL;
++    const uint t1  = gid / KL;
++    const uint i1  = t1 % Cout;
++    const uint ib  = t1 / Cout;
++
++    float acc = 0.0f;
++    for (uint i10 = 0; i10 < L; i10++) {
++        const int i00 = (int) ox - s0 * (int) i10;
++        if (i00 < 0 || (uint) i00 >= K) {
++            continue;
++        }
++        const uint ka0 = (uint) i00 * k_nb0 + i1 * k_nb01;
++        const uint ba0 = (uint) i10 * in_nb0 + ib * in_nb2;
++        for (uint ic = 0; ic < Cin; ic++) {
++            float kv = (float) kA[ka0 + ic * k_nb02];
++            float iv = bB[ba0 + ic * in_nb1];
++            acc = fma(kv, iv, acc);
++        }
++    }
++
++    dD[CTD_IDX(ox, i1, ib, d_nb0, d_nb1, d_nb2)] = acc;
++}
+diff --git a/src/ggml-opencl/kernels/conv_transpose_1d_f32.cl b/src/ggml-opencl/kernels/conv_transpose_1d_f32.cl
+new file mode 100644
+index 00000000..cba207cb
+--- /dev/null
++++ b/src/ggml-opencl/kernels/conv_transpose_1d_f32.cl
+@@ -0,0 +1,49 @@
++// CONV_TRANSPOSE_1D — f32 / f32 / f32
++// src0: [K, Cout, Cin], src1: [L, Cin, ...], dst: [KL, Cout, ...]
++
++#define CTD_IDX(ox, i1, ib, dnb0, dnb1, dnb2) \
++    ((ox) * (dnb0) + (i1) * (dnb1) + (ib) * (dnb2))
++
++kernel void kernel_conv_transpose_1d_f32(
++    global void * p_k, ulong off_k,
++    global void * p_in, ulong off_in,
++    global void * p_d, ulong off_d,
++    uint k_nb0, uint k_nb01, uint k_nb02,
++    uint in_nb0, uint in_nb1, uint in_nb2,
++    uint d_nb0, uint d_nb1, uint d_nb2,
++    uint K, uint Cout, uint Cin, uint L, uint KL,
++    uint nbatch,
++    int s0
++) {
++    global const float * kA = (global const float *) ((global const char *) p_k + off_k);
++    global const float * bB = (global const float *) ((global const char *) p_in + off_in);
++    global float * dD = (global float *) ((global char *) p_d + off_d);
++
++    const uint total = KL * Cout * nbatch;
++    const uint gid = get_global_id(0);
++    if (gid >= total) {
++        return;
++    }
++
++    const uint ox  = gid % KL;
++    const uint t1  = gid / KL;
++    const uint i1  = t1 % Cout;
++    const uint ib  = t1 / Cout;
++
++    float acc = 0.0f;
++    for (uint i10 = 0; i10 < L; i10++) {
++        const int i00 = (int) ox - s0 * (int) i10;
++        if (i00 < 0 || (uint) i00 >= K) {
++            continue;
++        }
++        const uint ka0 = (uint) i00 * k_nb0 + i1 * k_nb01;
++        const uint ba0 = (uint) i10 * in_nb0 + ib * in_nb2;
++        for (uint ic = 0; ic < Cin; ic++) {
++            float kv = kA[ka0 + ic * k_nb02];
++            float iv = bB[ba0 + ic * in_nb1];
++            acc = fma(kv, iv, acc);
++        }
++    }
++
++    dD[CTD_IDX(ox, i1, ib, d_nb0, d_nb1, d_nb2)] = acc;
++}
+diff --git a/src/ggml-opencl/kernels/sin.cl b/src/ggml-opencl/kernels/sin.cl
+new file mode 100644
+index 00000000..4ccbf5af
+--- /dev/null
++++ b/src/ggml-opencl/kernels/sin.cl
+@@ -0,0 +1,109 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++kernel void kernel_sin_f32(
++        global const float * src0,
++        ulong                offset0,
++        global       float * dst,
++        ulong                offsetd
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    dst  = (global float*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = sin(src0[get_global_id(0)]);
++}
++
++kernel void kernel_sin_f32_4(
++        global const float4 * src0,
++        ulong                 offset0,
++        global       float4 * dst,
++        ulong                 offsetd
++) {
++    src0 = (global float4*)((global char*)src0 + offset0);
++    dst  = (global float4*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = sin(src0[get_global_id(0)]);
++}
++
++kernel void kernel_sin_f16(
++        global const half * src0,
++        ulong               offset0,
++        global       half * dst,
++        ulong               offsetd
++) {
++    src0 = (global half*)((global char*)src0 + offset0);
++    dst  = (global half*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = sin(src0[get_global_id(0)]);
++}
++
++kernel void kernel_sin_f16_4(
++        global const half4 * src0,
++        ulong                offset0,
++        global       half4 * dst,
++        ulong                offsetd
++) {
++    src0 = (global half4*)((global char*)src0 + offset0);
++    dst  = (global half4*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = sin(src0[get_global_id(0)]);
++}
++
++kernel void kernel_sin_f32_nc(
++        global const char * src0,
++        ulong               offset0,
++        global       char * dst,
++        ulong               offsetd,
++        int   ne00,
++        ulong nb00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        ulong nb0,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src0 = src0 + offset0;
++    dst  = dst + offsetd;
++
++    const int i3 = get_group_id(2);
++    const int i2 = get_group_id(1);
++    const int i1 = get_group_id(0);
++
++    for (int i0 = get_local_id(0); i0 < ne00; i0 += get_local_size(0)) {
++        global const float * x = (global const float *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
++        global       float * y = (global       float *)(dst  + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
++
++        *y = sin(*x);
++    }
++}
++
++kernel void kernel_sin_f16_nc(
++        global const char * src0,
++        ulong               offset0,
++        global       char * dst,
++        ulong               offsetd,
++        int   ne00,
++        ulong nb00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        ulong nb0,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src0 = src0 + offset0;
++    dst  = dst + offsetd;
++
++    const int i3 = get_group_id(2);
++    const int i2 = get_group_id(1);
++    const int i1 = get_group_id(0);
++
++    for (int i0 = get_local_id(0); i0 < ne00; i0 += get_local_size(0)) {
++        global const half * x = (global const half *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
++        global       half * y = (global       half *)(dst  + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
++
++        *y = sin(*x);
++    }
++}

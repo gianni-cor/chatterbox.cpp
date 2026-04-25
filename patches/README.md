@@ -4,8 +4,15 @@
 [`README.md`](../README.md)), so any fixes we need in it live here as
 standalone patches and are applied after the clone.
 
-Only the Metal backend currently needs a patch. CPU / CUDA / Vulkan
-builds work with stock upstream ggml and can skip this step entirely.
+| Patch | When you need it |
+|--------|------------------|
+| `ggml-metal-chatterbox-ops.patch` | Building with **Metal** (Apple Silicon T3 + full pipeline). |
+| `ggml-opencl-chatterbox-ops.patch` | Building with **OpenCL** (e.g. Android / Termux + Adreno: `CONV_TRANSPOSE_1D` for HiFT, `SIN`, backend notes). |
+| (none) | **CPU** / **CUDA** / **Vulkan** only — stock upstream `ggml` is enough. |
+
+`setup-ggml.sh` always applies **both** patches in order (Metal, then
+OpenCL).  Extra OpenCL code is inert when you configure without
+`GGML_OPENCL=ON`.
 
 ## Apply
 
@@ -13,40 +20,45 @@ The top-level [`scripts/setup-ggml.sh`](../scripts/setup-ggml.sh) does
 everything for you:
 
 ```bash
-# From the repo root.  Clones ggml if needed, checks out the pinned
-# commit, and applies this patch.  Idempotent — re-running is a no-op.
+# From the repo root.  Clones ggml if needed, hard-resets to the pinned
+# commit, and applies both patch files.  Re-running overwrites any local
+# edits under ./ggml.
 ./scripts/setup-ggml.sh
 ```
 
-Then configure + build as usual. To enable Metal:
+Then configure + build as usual, for example:
 
 ```bash
+# Metal (macOS)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
 cmake --build build -j$(sysctl -n hw.ncpu)
+
+# OpenCL (e.g. Termux) — set LD_LIBRARY_PATH to your OpenCL/ggml DSOs
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL=ON
+cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
 
-If you'd rather run the two steps by hand (e.g. to pin a different
-upstream commit), the script is effectively:
+If you'd rather run the steps by hand (e.g. to pin a different upstream
+commit), the script is effectively:
 
 ```bash
 git clone https://github.com/ggml-org/ggml.git ggml
-cd ggml && git checkout $GGML_COMMIT
+cd ggml && git reset --hard $GGML_COMMIT && git clean -fdq
 git apply ../patches/ggml-metal-chatterbox-ops.patch
+git apply ../patches/ggml-opencl-chatterbox-ops.patch
 ```
 
 `GGML_COMMIT` lives at the top of `scripts/setup-ggml.sh` as the
-single source of truth — bump it when re-generating this patch
-against a newer upstream ggml.  To confirm the patch applied cleanly:
+single source of truth — bump it when re-generating patches
+against a newer upstream ggml.  To confirm they applied:
 
 ```bash
 (cd ggml && git status --short)
-# Expected: 7 modified files under ggml/src/ggml-metal/
+# Expected: files under src/ggml-metal/, include/ggml-opencl.h, src/ggml-opencl/…
 ```
 
-Skip the whole patch step on Linux or when building CPU-only (the
-stock upstream ggml works). `setup-ggml.sh` still clones at the
-pinned commit either way, which keeps builds deterministic even
-without the patch.
+Skip `setup-ggml.sh` only if you use `-DTTS_CPP_USE_SYSTEM_GGML=ON` with
+another ggml; otherwise the pin + patches keep builds deterministic.
 
 ## `ggml-metal-chatterbox-ops.patch`
 
@@ -76,6 +88,32 @@ Run it after rebuilding:
 # Expected: "diag_mask_inf / pad_ext / conv_transpose_1d: PASS"
 ```
 
+## `ggml-opencl-chatterbox-ops.patch`
+
+Base commit: `58c3805` (same pin as the Metal patch).
+
+Extends `ggml-opencl` so Chatterbox’s S3Gen + **HiFT** path can run on
+OpenCL (e.g. Qualcomm Adreno) instead of failing on missing ops:
+
+| What | Purpose |
+|------|---------|
+| `CONV_TRANSPOSE_1D` | f32 and f16-kernel + f32 input kernels, dispatch + `supports_op` |
+| `GGML_OP_SIN` | `sin.cl` (element-wise), dispatch + `supports_op` |
+| `ggml-opencl.h` | Document that `ggml_backend_opencl_init` may return NULL when no device |
+| Build | Register new `.cl` sources in `CMakeLists.txt` for embed |
+
+Regenerate from a throwaway `ggml` worktree at `GGML_COMMIT` after editing
+upstream:
+
+```bash
+# From cherry-picked commits or a branch:
+(cd ggml && git diff 58c38058..your-branch) > patches/ggml-opencl-chatterbox-ops.patch
+# Sanity check on a clean tree:
+git -C ggml reset --hard 58c38058 && git -C ggml clean -fdq
+git -C ggml apply ../patches/ggml-metal-chatterbox-ops.patch
+git -C ggml apply --check ../patches/ggml-opencl-chatterbox-ops.patch
+```
+
 ## Dropping the patch
 
 If upstream ggml merges equivalent fixes, delete the patch file and
@@ -84,4 +122,5 @@ of Chatterbox uses only ops supported by every backend, so nothing else
 needs to change.
 
 No patch is needed for CPU / CUDA / Vulkan — those backends already
-handle every op Chatterbox emits.
+handle every op Chatterbox emits, except where OpenCL still trails;
+use this OpenCL patch when targeting OpenCL.

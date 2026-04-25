@@ -75,9 +75,8 @@ cd -
 git clone git@github.com:gianni-cor/chatterbox.cpp.git
 cd chatterbox.cpp
 
-# Clone ggml at the pinned commit and apply our Metal op patches.
-# Skip the patch part (i.e. just `git clone ... ggml`) if you're not
-# building with -DGGML_METAL=ON.
+# Clone ggml at the pinned commit and apply the Metal + OpenCL patches
+# (see patches/).  Re-running resets ./ggml to the pin and reapplies.
 ./scripts/setup-ggml.sh
 
 # Configure + build every target in one shot.
@@ -85,19 +84,23 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
 
-`scripts/setup-ggml.sh` is idempotent: it clones upstream
-[`ggml`](https://github.com/ggml-org/ggml) into `./ggml`, checks out the
-commit our patch is pinned against (`GGML_COMMIT` at the top of the
-script), and applies
-[`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch).
-Re-running it is a no-op; bump the pinned commit inside the script
-whenever the patch is re-generated against a newer upstream.
+`scripts/setup-ggml.sh` clones upstream
+[`ggml`](https://github.com/ggml-org/ggml) into `./ggml`, hard-resets to the
+commit pinned in `GGML_COMMIT`, and applies
+[`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch)
+then
+[`patches/ggml-opencl-chatterbox-ops.patch`](patches/ggml-opencl-chatterbox-ops.patch).
+Re-running is safe: any local edits under `./ggml` are discarded.  Bump
+`GGML_COMMIT` and regenerate the patches when moving to a newer upstream
+ggml.
 
 To enable GPU acceleration, add the matching backend flag at configure
 time: `-DGGML_METAL=ON` on Apple Silicon, `-DGGML_VULKAN=ON` on
-Linux/Windows with a Vulkan loader, or `-DGGML_CUDA=ON` if you have the
-CUDA toolkit. Pass `--n-gpu-layers 99` at runtime to actually use the
-GPU. See `patches/README.md` for what the Metal patch does and why.
+Linux/Windows with a Vulkan loader, `-DGGML_OPENCL=ON` for OpenCL
+(Android/Termux, etc., after applying the OpenCL patch above), or
+`-DGGML_CUDA=ON` if you have the CUDA toolkit. Pass `--n-gpu-layers 99` at
+runtime to actually use the GPU. See `patches/README.md` for what the
+patches do and why.
 
 This produces the main binary plus a set of per-stage validation harnesses:
 
@@ -695,7 +698,8 @@ chatterbox.cpp/
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
   patches/
-    ggml-metal-chatterbox-ops.patch  ggml-metal fixes (see patches/README.md)
+    ggml-metal-chatterbox-ops.patch   ggml-metal fixes
+    ggml-opencl-chatterbox-ops.patch  OpenCL: HiFT (CONV_TRANSPOSE_1D, SIN, …)
     README.md                    applies-to / what-it-does notes
   voices/                        baked voice profiles (not tracked; populated
                                    by --save-voice)
