@@ -62,10 +62,9 @@ struct s3gen_synthesize_opts {
     bool debug     = false;      // validation mode; requires ref_dir
     bool verbose   = false;      // print per-stage wall times to stderr
 
-    // When > 0, try to run S3Gen + HiFT on a GPU backend (CUDA / Metal / Vulkan
-    // depending on what the build enables).  Falls back to CPU if the backend
-    // cannot be initialised.  The actual layer count is not yet used for split
-    // offload; any positive value enables the GPU path.
+    // When > 0, try to run S3Gen + HiFT on a GPU backend (CUDA / Metal / Vulkan /
+    // OpenCL depending on what the build enables).  The actual layer count is not
+    // used for split offload; any positive value enables the GPU path where supported.
     int  n_gpu_layers = 0;
 
     // ---------------- streaming support (PROGRESS.md B1) ----------------

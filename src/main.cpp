@@ -17,6 +17,10 @@
 #include "ggml-vulkan.h"
 #endif
 
+#ifdef GGML_USE_OPENCL
+#include "ggml-opencl.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -308,6 +312,26 @@ ggml_backend_t init_backend(int n_gpu_layers) {
                 fprintf(stderr, "%s: using Vulkan backend (device 0: %s)\n", __func__, desc);
             }
             return b;
+        }
+    }
+#endif
+#ifdef GGML_USE_OPENCL
+    if (n_gpu_layers > 0) {
+        ggml_backend_reg_t ocl_reg = ggml_backend_opencl_reg();
+        if (ocl_reg && ggml_backend_reg_dev_count(ocl_reg) > 0) {
+            auto * b = ggml_backend_opencl_init();
+            if (b) {
+                if (v) {
+                    fprintf(stderr, "%s: using OpenCL backend\n", __func__);
+                }
+                return b;
+            }
+        } else if (v && ocl_reg) {
+            if (ggml_backend_reg_dev_count(ocl_reg) == 0) {
+                fprintf(stderr, "%s: no OpenCL device; using CPU\n", __func__);
+            } else {
+                fprintf(stderr, "%s: OpenCL init failed; using CPU\n", __func__);
+            }
         }
     }
 #endif
