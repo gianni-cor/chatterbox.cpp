@@ -99,13 +99,6 @@ Linux/Windows with a Vulkan loader, or `-DGGML_CUDA=ON` if you have the
 CUDA toolkit. Pass `--n-gpu-layers 99` at runtime to actually use the
 GPU. See `patches/README.md` for what the Metal patch does and why.
 
-**OpenCL** (`-DGGML_OPENCL=ON`): do not use the Mac for validation — Apple’s
-OpenCL is deprecated and local CMake builds often fail on headers or
-linking. Build and test on a **remote device** instead (e.g. Termux on
-Android with an Adreno GPU), then source
-[`scripts/termux-opencl-env.sh`](scripts/termux-opencl-env.sh) so
-`libOpenCL` and bundled ggml DSOs resolve on `LD_LIBRARY_PATH`.
-
 This produces the main binary plus a set of per-stage validation harnesses:
 
 | Binary | What it does |

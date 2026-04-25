@@ -25,18 +25,6 @@
 #include <string>
 #include <vector>
 
-// Same as chatterbox_tts: OpenCL has no LEAKY_RELU op; use relu/neg/scale.
-static ggml_tensor * tts_leaky_relu(ggml_context * ctx, ggml_tensor * x, float negative_slope) {
-    return ggml_sub(ctx, ggml_relu(ctx, x),
-        ggml_scale(ctx, ggml_relu(ctx, ggml_neg(ctx, x)), negative_slope));
-}
-
-static ggml_tensor * tts_elu(ggml_context * ctx, ggml_tensor * x, float alpha = 1.0f) {
-    ggml_tensor * r  = ggml_relu(ctx, x);
-    ggml_tensor * m0 = ggml_sub(ctx, x, r);
-    return ggml_add(ctx, r, ggml_scale(ctx, ggml_expm1(ctx, m0), alpha));
-}
-
 // ---------- GGUF loader (same as test_s3gen.cpp) ----------
 struct model_ctx {
     ggml_backend_t backend = nullptr;
@@ -254,14 +242,14 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
         ggml_tensor * xp = ggml_pad_ext(ctx, x, 1, 1, 0, 0, 0, 0, 0, 0);
         x = conv1d_f32(ctx, w, xp, 1, 0, 1);
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
-        x = tts_elu(ctx, x, 1.0f);
+        x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
     ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));  // [512, T]
     ggml_tensor * cw = find_tensor(m, "hift/f0_predictor/classifier/weight");
     ggml_tensor * cb = find_tensor(m, "hift/f0_predictor/classifier/bias");
     ggml_tensor * y = ggml_mul_mat(ctx, cw, xp);
     y = ggml_add(ctx, y, cb);
-    y = ggml_sqrt(ctx, ggml_sqr(ctx, y));
+    y = ggml_abs(ctx, y);
     y = ggml_reshape_1d(ctx, y, T_mel);
     ggml_set_name(y, "out"); ggml_set_output(y);
     ggml_build_forward_expand(gf, y);
@@ -361,7 +349,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cpb, 1, BASE_CH));
 
     for (int i = 0; i < 3; ++i) {
-        x = tts_leaky_relu(ctx, x, 0.1f);
+        x = ggml_leaky_relu(ctx, x, 0.1f, false);
         ggml_tensor * uw = find_tensor(m, "hift/ups/" + std::to_string(i) + "/weight");
         ggml_tensor * ub = find_tensor(m, "hift/ups/" + std::to_string(i) + "/bias");
         int up_pad = (ups_ksizes[i] - ups_rates[i]) / 2;
@@ -393,7 +381,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
         x = ggml_scale(ctx, xs, 1.0f / 3.0f);
     }
 
-    x = tts_leaky_relu(ctx, x, 0.01f);
+    x = ggml_leaky_relu(ctx, x, 0.01f, false);
     ggml_tensor * cp2w = find_tensor(m, "hift/conv_post/weight");
     ggml_tensor * cp2b = find_tensor(m, "hift/conv_post/bias");
     x = ggml_pad_ext(ctx, x, 3, 3, 0, 0, 0, 0, 0, 0);

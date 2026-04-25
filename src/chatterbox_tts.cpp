@@ -37,9 +37,7 @@
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
-#ifdef GGML_USE_OPENCL
-#include "ggml-opencl.h"
-#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -78,21 +76,6 @@ struct scoped_timer {
 };
 #define TIMED(label) scoped_timer _st_##__LINE__(label)
 
-// LeakyReLU: identical to torch.nn.LeakyReLU(s).  ggml’s fused op (GGML_OP_LEAKY_RELU)
-// is not implemented on the OpenCL backend; relu/neg/scale/sub are.
-static ggml_tensor * tts_leaky_relu(ggml_context * ctx, ggml_tensor * x, float negative_slope) {
-    return ggml_sub(ctx, ggml_relu(ctx, x),
-        ggml_scale(ctx, ggml_relu(ctx, ggml_neg(ctx, x)), negative_slope));
-}
-
-// ELU: relu(x) + alpha * expm1(min(0,x)).  Same as torch (alpha=1 default).  Avoids
-// GGML_UNARY_OP_ELU, which the OpenCL backend may not support.
-static ggml_tensor * tts_elu(ggml_context * ctx, ggml_tensor * x, float alpha = 1.0f) {
-    ggml_tensor * r  = ggml_relu(ctx, x);
-    ggml_tensor * m0 = ggml_sub(ctx, x, r);
-    return ggml_add(ctx, r, ggml_scale(ctx, ggml_expm1(ctx, m0), alpha));
-}
-
 // ============================================================================
 // GGUF loader + helpers
 // ============================================================================
@@ -127,26 +110,6 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
                 fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
             }
             return b;
-        }
-    }
-#endif
-#if defined(GGML_USE_OPENCL)
-    if (n_gpu_layers > 0) {
-        ggml_backend_reg_t ocl_reg = ggml_backend_opencl_reg();
-        if (ocl_reg && ggml_backend_reg_dev_count(ocl_reg) > 0) {
-            auto * b = ggml_backend_opencl_init();
-            if (b) {
-                if (verbose) {
-                    fprintf(stderr, "s3gen: using OpenCL backend\n");
-                }
-                return b;
-            }
-        } else if (verbose && ocl_reg) {
-            if (ggml_backend_reg_dev_count(ocl_reg) == 0) {
-                fprintf(stderr, "s3gen: no OpenCL device; using CPU\n");
-            } else {
-                fprintf(stderr, "s3gen: OpenCL init failed; using CPU\n");
-            }
         }
     }
 #endif
@@ -305,8 +268,8 @@ static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_fr
 }
 
 static ggml_tensor * ggml_mish_fn(ggml_context * ctx, ggml_tensor * x) {
-    ggml_tensor * sp = ggml_softplus(ctx, x);
-    ggml_tensor * th = ggml_tanh(ctx, sp);
+    ggml_tensor * sp = ggml_unary(ctx, x, GGML_UNARY_OP_SOFTPLUS);
+    ggml_tensor * th = ggml_unary(ctx, sp, GGML_UNARY_OP_TANH);
     return ggml_mul(ctx, x, th);
 }
 
@@ -496,7 +459,7 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     xt = zero_pad_dim0(ctx, xt, 0, 3);
     xt = conv1d_f32(ctx, pw1, xt, 1, 0, 1);
     xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, pb1, 1, D));
-    xt = tts_leaky_relu(ctx, xt, 0.01f);
+    xt = ggml_leaky_relu(ctx, xt, 0.01f, false);
     xt = zero_pad_dim0(ctx, xt, 2, 0);
     xt = conv1d_f32(ctx, pw2, xt, 1, 0, 1);
     xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, pb2, 1, D));
@@ -994,15 +957,14 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
         int C_out = (int)w->ne[2];
         x = conv1d_f32(ctx, w, x, 1, 1, 1);
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
-        x = tts_elu(ctx, x, 1.0f);
+        x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
     ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     ggml_tensor * cw = find_tensor(m, "hift/f0_predictor/classifier/weight");
     ggml_tensor * cb = find_tensor(m, "hift/f0_predictor/classifier/bias");
     ggml_tensor * y = ggml_mul_mat(ctx, cw, xp);
     y = ggml_add(ctx, y, cb);
-    // abs(x) = sqrt(sqr(x)) — OpenCL may not implement UNARY(ABS) on all devices
-    y = ggml_sqrt(ctx, ggml_sqr(ctx, y));
+    y = ggml_abs(ctx, y);
     y = ggml_reshape_1d(ctx, y, T_mel);
     ggml_set_name(y, "out"); ggml_set_output(y);
     ggml_build_forward_expand(gf, y);
@@ -1164,7 +1126,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cpb, 1, BASE_CH));
 
     for (int i = 0; i < 3; ++i) {
-        x = tts_leaky_relu(ctx, x, 0.1f);
+        x = ggml_leaky_relu(ctx, x, 0.1f, false);
         ggml_tensor * uw = find_tensor(m, "hift/ups/" + std::to_string(i) + "/weight");
         ggml_tensor * ub = find_tensor(m, "hift/ups/" + std::to_string(i) + "/bias");
         int up_pad = (ups_ksizes[i] - ups_rates[i]) / 2;
@@ -1194,7 +1156,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
         x = ggml_scale(ctx, xs, 1.0f / 3.0f);
     }
 
-    x = tts_leaky_relu(ctx, x, 0.01f);
+    x = ggml_leaky_relu(ctx, x, 0.01f, false);
     ggml_tensor * cp2w = find_tensor(m, "hift/conv_post/weight");
     ggml_tensor * cp2b = find_tensor(m, "hift/conv_post/bias");
     x = conv1d_f32(ctx, cp2w, x, 1, 3, 1);
