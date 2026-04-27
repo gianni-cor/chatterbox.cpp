@@ -25,9 +25,15 @@
 //         write_wav(result.pcm, result.sample_rate);
 //     }
 //
-// Not thread-safe for concurrent `synthesize()` calls on the same
-// instance (the T3 KV cache + CFM rng are shared state).  `cancel()`
-// is safe to call from any thread.
+// Threading model:
+//   - `synthesize()` on the same `Engine` instance is **not** safe to
+//     call concurrently — the T3 KV cache, gallocr, and CFM rng are
+//     per-instance shared state.
+//   - `synthesize()` on **different** `Engine` instances from
+//     different threads is safe.  Internal scratch buffers used by the
+//     T3 graph builders are `thread_local`, so two threads do not race
+//     on a shared graph workspace.
+//   - `cancel()` is safe to call from any thread.
 //
 // Implemented in src/chatterbox_engine.cpp on top of the library-internal
 // helpers in src/chatterbox_t3_internal.h.

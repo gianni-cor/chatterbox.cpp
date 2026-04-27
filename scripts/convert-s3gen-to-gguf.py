@@ -41,9 +41,37 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 
-REPO_ID = "ResembleAI/chatterbox-turbo"
+TURBO_REPO_ID = "ResembleAI/chatterbox-turbo"
+MTL_REPO_ID   = "ResembleAI/chatterbox"
 
-QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
+VARIANTS = {
+    "turbo": {
+        "repo_id": TURBO_REPO_ID,
+        "allow_patterns": ["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"],
+        "ckpt_filename": "s3gen_meanflow.safetensors",
+        "loader": "safetensors",
+        "gguf_name": "Chatterbox Turbo S3Gen",
+        "gguf_description": "S3Gen flow + mel2wav (HiFT) for ggml port.",
+        "meanflow": True,
+        "n_timesteps": 2,
+        "cfg_rate": 0.0,
+    },
+    "mtl": {
+        "repo_id": MTL_REPO_ID,
+        "allow_patterns": ["ve.pt", "t3_mtl23ls_v2.safetensors", "s3gen.pt",
+                           "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"],
+        "ckpt_filename": "s3gen.pt",
+        "loader": "torch",
+        "gguf_name": "Chatterbox Multilingual S3Gen",
+        "gguf_description": "S3Gen standard-CFM (10-step Euler, CFG) + HiFT vocoder for ggml port.",
+        "meanflow": False,
+        "n_timesteps": 10,
+        "cfg_rate": 0.7,
+    },
+}
+
+
+QUANT_CHOICES = ("f32", "f16", "q8_0", "q5_0", "q4_0")
 
 
 def _load_requantize_policy():
@@ -62,23 +90,38 @@ _SHOULD_QUANTIZE, _RQ_QUANT_TYPE = _load_requantize_policy()
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Convert Chatterbox Turbo S3Gen weights to GGUF.")
+    ap = argparse.ArgumentParser(description="Convert Chatterbox S3Gen weights to GGUF.")
+    ap.add_argument("--variant", choices=list(VARIANTS.keys()), default="turbo",
+                    help="Which S3Gen checkpoint to convert. 'turbo' = meanflow (2-step),"
+                         " 'mtl' = standard CFM (10-step + CFG).")
     ap.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")
-    ap.add_argument("--out", type=Path, default=Path("models/chatterbox-s3gen.gguf"), help="Output GGUF path.")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="Defaults to models/chatterbox-s3gen.gguf (turbo) or "
+                         "models/chatterbox-s3gen-mtl.gguf (mtl).")
     ap.add_argument("--hf-token", default=None, help="Optional Hugging Face token.")
     ap.add_argument(
         "--quant",
         choices=QUANT_CHOICES,
         default="f16",
         help=(
-            "f16: store all float weights as F32 in GGUF (default). "
-            "q8_0 / q5_0 / q4_0: block-quantize eligible 2-D matrices per "
-            "scripts/requantize-gguf.py (same deny-list: no quant on "
-            "flow/input_embedding, campplus, s3tokv2, builtins, mel filterbanks, "
-            "norms/biases)."
+            "Target format for the big matmul weights (encoder Linears, "
+            "CFM attn/FF Linears, HiFT Conv1d weights, CAMPPlus/S3TokenizerV2). "
+            "Biases, LayerNorm gammas/betas, embeddings, filterbanks and "
+            "built-in conditionals always stay F32. Tensors whose shape cannot "
+            "hold the requested block quant (rank != 2 or ne[0] not a multiple "
+            "of 32) transparently fall back to F16 so conv kernels still "
+            "benefit even at q8_0/q5_0/q4_0. q8_0/q5_0/q4_0 follow the same "
+            "deny-list as scripts/requantize-gguf.py (no quant on "
+            "flow/input_embedding, campplus, s3tokv2, builtins, mel "
+            "filterbanks, norms/biases). Default f16 stores all float "
+            "weights as F32 in GGUF (the pre-multilingual baseline)."
         ),
     )
-    return ap.parse_args()
+    args = ap.parse_args()
+    if args.out is None:
+        args.out = Path("models/chatterbox-s3gen-mtl.gguf") if args.variant == "mtl" \
+                   else Path("models/chatterbox-s3gen.gguf")
+    return args
 
 
 def as_numpy(tensor: torch.Tensor, *, dtype=None) -> np.ndarray:
@@ -140,7 +183,7 @@ def add_tensor_maybe_q(
     if arr.dtype.kind in "iu" or np.issubdtype(arr.dtype, np.integer):
         writer.add_tensor(name, arr)
         return
-    if quant == "f16":
+    if quant in ("f16", "f32"):
         writer.add_tensor(name, arr)
         return
 
@@ -195,17 +238,24 @@ def export_conformer_block(
 
 def main():
     args = parse_args()
+    cfg = VARIANTS[args.variant]
     if args.ckpt_dir:
         ckpt_dir = args.ckpt_dir
     else:
         ckpt_dir = Path(snapshot_download(
-            repo_id=REPO_ID, token=args.hf_token,
-            allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"],
+            repo_id=cfg["repo_id"], token=args.hf_token,
+            allow_patterns=cfg["allow_patterns"],
         ))
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading s3gen_meanflow from {ckpt_dir}")
-    raw = load_file(ckpt_dir / "s3gen_meanflow.safetensors")
+    ckpt_path = ckpt_dir / cfg["ckpt_filename"]
+    print(f"Loading {ckpt_path}")
+    if cfg["loader"] == "safetensors":
+        raw = load_file(ckpt_path)
+    elif cfg["loader"] == "torch":
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    else:
+        raise ValueError(f"unknown loader: {cfg['loader']}")
     state = expand_weight_norm(raw)
 
     print(f"Resolved {len([k for k in raw if 'parametrizations' in k])} weight_norm entries")
@@ -214,11 +264,16 @@ def main():
     gen = conds["gen"]
 
     writer = gguf.GGUFWriter(str(args.out), "chatterbox-s3gen")
-    writer.add_name("Chatterbox Turbo S3Gen")
-    writer.add_description("S3Gen flow + mel2wav (HiFT) for ggml port.")
+    writer.add_name(cfg["gguf_name"])
+    writer.add_description(cfg["gguf_description"])
     writer.add_string("s3gen.quantization", args.quant)
 
-    qstats: Optional[dict[str, int]] = {"n_quant": 0} if args.quant != "f16" else None
+    writer.add_string("s3gen.variant", args.variant)
+    writer.add_bool("s3gen.meanflow", cfg["meanflow"])
+    writer.add_uint32("s3gen.n_timesteps", cfg["n_timesteps"])
+    writer.add_float32("s3gen.cfg_rate", cfg["cfg_rate"])
+
+    qstats: Optional[dict[str, int]] = {"n_quant": 0} if args.quant not in ("f16", "f32") else None
 
     # Meta / hparams
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
@@ -263,7 +318,7 @@ def main():
     add_tensor_maybe_q(writer, "flow/encoder/pre_lookahead/conv2/w", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.weight"]), args.quant, stats=qstats)
     add_tensor_maybe_q(writer, "flow/encoder/pre_lookahead/conv2/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.bias"]), args.quant, stats=qstats)
 
-    # 6 Conformer blocks
+    # 6 Conformer blocks.
     for i in range(6):
         export_conformer_block(writer, state,
                                f"flow.encoder.encoders.{i}",
@@ -281,7 +336,7 @@ def main():
     add_tensor_maybe_q(writer, "flow/encoder/up_embed/norm/w",   as_numpy(state["flow.encoder.up_embed.out.1.weight"]), args.quant, stats=qstats)
     add_tensor_maybe_q(writer, "flow/encoder/up_embed/norm/b",   as_numpy(state["flow.encoder.up_embed.out.1.bias"]), args.quant, stats=qstats)
 
-    # 4 more Conformer blocks
+    # 4 more Conformer blocks.
     for i in range(4):
         export_conformer_block(writer, state,
                                f"flow.encoder.up_encoders.{i}",
@@ -293,13 +348,19 @@ def main():
     add_tensor_maybe_q(writer, "flow/encoder/after_norm/w", as_numpy(state["flow.encoder.after_norm.weight"]), args.quant, stats=qstats)
     add_tensor_maybe_q(writer, "flow/encoder/after_norm/b", as_numpy(state["flow.encoder.after_norm.bias"]), args.quant, stats=qstats)
 
-    # Decoder estimator (CFM) — F32 (we use conv1d_f32 helper).
+    # Decoder estimator (CFM) — the critical path on CPU/Metal/Vulkan since
+    # it runs 10-20 forwards per utterance on standard CFM.  Linear weights
+    # pick up Q8_0 and Conv1d kernels pick up F16; LayerNorm gammas/betas +
+    # biases are rank-1 and stay F32 via the requantize policy guard.
     decoder_keys = sorted(k for k in state if k.startswith("flow.decoder.estimator."))
     for k in decoder_keys:
         gguf_name = k.replace("flow.decoder.estimator.", "cfm/").replace(".", "/")
         add_tensor_maybe_q(writer, gguf_name, as_numpy(state[k], dtype=torch.float32), args.quant, stats=qstats)
 
-    # mel2wav (HiFTGenerator) — F32 (we use conv1d_f32 helper)
+    # mel2wav (HiFTGenerator): dozens of weight_norm Conv1d layers feeding
+    # the 24 kHz vocoder.  These are almost all rank-3 (K, IC, OC) with
+    # short kernels → F16 at any --quant >= f16.  Real bandwidth savings on
+    # every backend (HiFT decode is ~8% of CPU wall time on MTL).
     mel2wav_keys = sorted(k for k in state if k.startswith("mel2wav."))
     for k in mel2wav_keys:
         gguf_name = k.replace("mel2wav.", "hift/").replace(".", "/")
@@ -326,7 +387,7 @@ def main():
     # -------------------------------------------------------------------------
     speaker_keys = [k for k in state if k.startswith("speaker_encoder.")]
     if not speaker_keys:
-        print("warning: no speaker_encoder.* tensors found in s3gen.safetensors")
+        print(f"warning: no speaker_encoder.* tensors found in {ckpt_path}")
     else:
         BN_EPS = 1e-5  # torch.nn.BatchNorm default
 
@@ -450,7 +511,7 @@ def main():
     # -------------------------------------------------------------------------
     tok_keys = [k for k in state if k.startswith("tokenizer.")]
     if not tok_keys:
-        print("warning: no tokenizer.* tensors found in s3gen.safetensors")
+        print(f"warning: no tokenizer.* tensors found in {ckpt_path}")
     else:
         n_tok = 0
         for k in tok_keys:
@@ -492,8 +553,10 @@ def main():
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    print(f"\nOutput: {args.out}")
-    if args.quant != "f16" and qstats is not None:
+
+    out_size_mb = args.out.stat().st_size / (1024 * 1024)
+    print(f"\nOutput: {args.out} ({out_size_mb:.0f} MB)")
+    if args.quant not in ("f16", "f32") and qstats is not None:
         print(f"  --quant {args.quant}: {qstats['n_quant']} tensors block-quantized "
               f"(policy matches scripts/requantize-gguf.py; embeddings, voice encoders, "
               f"norms/biases, and filterbanks kept at full precision)")

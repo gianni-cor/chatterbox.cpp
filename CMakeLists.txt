@@ -43,7 +43,12 @@ set(TTS_CPP_LIB_SOURCES
     src/voice_encoder.cpp
     src/campplus.cpp
     src/s3tokenizer.cpp
+    src/t3_mtl.cpp
 )
+
+add_library(mtl_tokenizer STATIC src/mtl_tokenizer.cpp)
+target_include_directories(mtl_tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(mtl_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if (TTS_CPP_BUILD_LIBRARY)
     add_library(tts-cpp STATIC ${TTS_CPP_LIB_SOURCES})
@@ -59,6 +64,7 @@ if (TTS_CPP_BUILD_LIBRARY)
     )
     target_compile_features(tts-cpp PUBLIC cxx_std_17)
     target_link_libraries(tts-cpp PUBLIC ggml)
+    target_link_libraries(tts-cpp PRIVATE mtl_tokenizer)
 
     if (OpenMP_CXX_FOUND)
         target_link_libraries(tts-cpp PRIVATE OpenMP::OpenMP_CXX)
@@ -90,6 +96,9 @@ if (TTS_CPP_BUILD_EXECUTABLES)
 
     add_executable(tts-cli src/cli_main.cpp)
     target_link_libraries(tts-cli PRIVATE tts-cpp)
+
+    add_executable(chatterbox src/cli_main.cpp)
+    target_link_libraries(chatterbox PRIVATE tts-cpp)
 
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
@@ -155,6 +164,24 @@ if (TTS_CPP_BUILD_TESTS)
         src/s3tokenizer.cpp)
     target_link_libraries(test-s3tokenizer PRIVATE ggml)
     target_include_directories(test-s3tokenizer PRIVATE ggml/include src)
+
+    add_executable(test-mtl-tokenizer src/test_mtl_tokenizer.cpp)
+    target_link_libraries(test-mtl-tokenizer PRIVATE mtl_tokenizer)
+    target_include_directories(test-mtl-tokenizer PRIVATE src)
+
+    add_executable(test-t3-mtl src/test_t3_mtl.cpp)
+    target_link_libraries(test-t3-mtl PRIVATE tts-cpp ggml)
+    target_include_directories(test-t3-mtl PRIVATE ggml/include src include)
+    if (GGML_METAL)
+        target_compile_definitions(test-t3-mtl PRIVATE GGML_USE_METAL)
+    endif()
+
+    add_executable(test-t3-mtl-stages src/test_t3_mtl_stages.cpp)
+    target_link_libraries(test-t3-mtl-stages PRIVATE tts-cpp ggml)
+    target_include_directories(test-t3-mtl-stages PRIVATE ggml/include src include)
+    if (GGML_METAL)
+        target_compile_definitions(test-t3-mtl-stages PRIVATE GGML_USE_METAL)
+    endif()
 
     add_executable(test-streaming
         src/test_streaming.cpp

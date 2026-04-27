@@ -88,6 +88,15 @@ struct model_ctx {
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    // Variant metadata read from GGUF once at load time.
+    //   meanflow=true  : Turbo (2-step Euler, time_embed_mixer, noised_mels overlay,
+    //                    no CFG on the CFM side)
+    //   meanflow=false : Multilingual (10-step Euler with cosine t_schedule,
+    //                    classifier-free-guidance via cfg_rate)
+    bool  meanflow    = true;
+    int   n_timesteps = 2;
+    float cfg_rate    = 0.0f;
 };
 
 static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
@@ -234,6 +243,35 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
         ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
     }
+
+    {
+        int64_t k_mf = gguf_find_key(g, "s3gen.meanflow");
+        int64_t k_ts = gguf_find_key(g, "s3gen.n_timesteps");
+        int64_t k_cf = gguf_find_key(g, "s3gen.cfg_rate");
+        m.meanflow    = (k_mf >= 0) ? gguf_get_val_bool(g, k_mf) : true;
+        m.n_timesteps = (k_ts >= 0) ? (int) gguf_get_val_u32(g, k_ts) : (m.meanflow ? 2 : 10);
+        m.cfg_rate    = (k_cf >= 0) ? gguf_get_val_f32(g, k_cf) : (m.meanflow ? 0.0f : 0.7f);
+        if (k_mf < 0 && k_ts < 0 && k_cf < 0) {
+            // Pre-§3.19 GGUFs lack the variant keys.  Defaults match the
+            // historical Turbo behaviour, so legacy chatterbox-s3gen.gguf
+            // files continue to work unchanged.  Print a one-time warning
+            // because the same defaults applied to a *multilingual* S3Gen
+            // GGUF produced by an older converter would silently run the
+            // wrong CFM solver and emit garbage.  Re-converting picks up
+            // the proper keys.
+            fprintf(stderr, "warning: s3gen GGUF lacks variant keys "
+                            "(s3gen.meanflow / n_timesteps / cfg_rate); "
+                            "assuming Turbo (meanflow, 2 steps).  If this is "
+                            "an MTL S3Gen, re-run "
+                            "scripts/convert-s3gen-to-gguf.py --variant mtl.\n");
+        }
+        if (verbose) {
+            fprintf(stderr, "  s3gen variant: %s (n_timesteps=%d, cfg_rate=%.2f)\n",
+                    m.meanflow ? "meanflow" : "standard CFM + CFG",
+                    m.n_timesteps, m.cfg_rate);
+        }
+    }
+
     gguf_free(g);
     ggml_free(tmp_ctx);
     return m;
@@ -253,6 +291,28 @@ static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_t
         ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
         ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
     return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
+}
+
+// Batch-aware F32 conv1d.  Input: (L, IC, B) or (L, IC).  Kernel: (K, IC, OC).
+// Output: (L_out, OC, B).  B=1 degenerates to the old (L_out, OC, 1) layout.
+//
+// ggml_mul_mat broadcasts its FIRST operand over the SECOND's ne[2..3]
+// (the docs state: "A: [ne03, ne02, n, k]", "B: [ne03*x, ne02*y, m, k]"),
+// and ggml_can_mul_mat rejects the opposite broadcast direction.  When the
+// im2col output carries a batch dim and the kernel does not, we therefore
+// put the kernel first and permute the result back to (L_out, OC, B) so
+// downstream bias-add + LayerNorm layouts stay the same as the batch=1
+// path.
+static ggml_tensor * conv1d_f32_b(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
+                                  int stride, int padding, int dilation) {
+    ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    // im2col ne=[K*IC, L_out, B]
+    ggml_tensor * k_flat = ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]);
+    // mul_mat(A=k_flat[k=K*IC, n=OC], B=im2col[k=K*IC, m=L_out, ne02=B])
+    //   → result ne=[OC, L_out, B]
+    ggml_tensor * prod = ggml_mul_mat(ctx, k_flat, im2col);
+    // Permute (OC, L_out, B) → (L_out, OC, B).
+    return ggml_cont(ctx, ggml_permute(ctx, prod, 1, 0, 2, 3));
 }
 
 static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * kernel,
@@ -637,10 +697,15 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
     ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
     ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
-    // (INNER, T) -> (HD, H, T) -> (HD, T, H) contiguous for flash-attn
-    q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, HD, H, T), 0, 2, 1, 3));
-    k = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, HD, H, T), 0, 2, 1, 3));
-    v = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v, HD, H, T), 0, 2, 1, 3));
+    // Zero-cont Q/K/V for flash-attn (see PROGRESS.md 3.14).  After
+    // mul_mat the result is (INNER, T) contiguous; INNER = H * HD.
+    // Metal's flash_attn_ext takes strided (HD, T, H) views directly,
+    // so drop the reshape+permute+cont triple.
+    const size_t col_stride  = (size_t) INNER * sizeof(float);
+    const size_t head_stride = (size_t) HD    * sizeof(float);
+    q = ggml_view_3d(ctx, q, HD, T, H, col_stride, head_stride, 0);
+    k = ggml_view_3d(ctx, k, HD, T, H, col_stride, head_stride, 0);
+    v = ggml_view_3d(ctx, v, HD, T, H, col_stride, head_stride, 0);
 
     // Fused softmax(QK^T / sqrt(HD)) @ V, streaming (no materialized T x T attn matrix).
     // Output layout is (HD, H, T) internally ((D, H, N) per flash_attn_ext docs).
@@ -678,6 +743,85 @@ static ggml_tensor * cfm_causal_k3(ggml_context * ctx, ggml_tensor * x,
                                    ggml_tensor * w, ggml_tensor * b, int C_out) {
     ggml_tensor * xp = zero_pad_dim0(ctx, x, 2, 0);
     ggml_tensor * y = conv1d_f32(ctx, w, xp, 1, 0, 1);
+    return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C_out));
+}
+
+// --------------------------------------------------------------------------
+// Batch-aware CFM estimator helpers.  These mirror the batch=1 helpers but
+// preserve an outer batch dim so the non-meanflow CFG path can run cond +
+// uncond through the decoder in a single forward call (batch=2), amortising
+// the weight-read cost across both passes.
+//
+// Shape convention: x ne=[T, C, B].  t_emb is (TIME_DIM, B).  Biases are
+// (C,) — ggml broadcasts size-1 dims.
+// --------------------------------------------------------------------------
+
+static ggml_tensor * cfm_causal_block_b(ggml_context * ctx, ggml_tensor * x,
+                                        ggml_tensor * conv_w, ggml_tensor * conv_b,
+                                        ggml_tensor * ln_w, ggml_tensor * ln_b, int64_t C_out) {
+    ggml_tensor * xp = zero_pad_dim0(ctx, x, 2, 0);
+    ggml_tensor * y = conv1d_f32_b(ctx, conv_w, xp, 1, 0, 1);
+    y = ggml_add(ctx, y, ggml_reshape_2d(ctx, conv_b, 1, C_out));
+    y = layer_norm_on_channel(ctx, y, ln_w, ln_b);
+    return ggml_mish_fn(ctx, y);
+}
+
+static ggml_tensor * cfm_resnet_b(ggml_context * ctx, const cfm_resnet_w & w,
+                                  ggml_tensor * x, ggml_tensor * t_emb_b, int64_t C_out) {
+    ggml_tensor * h = cfm_causal_block_b(ctx, x, w.b1_conv_w, w.b1_conv_b, w.b1_ln_w, w.b1_ln_b, C_out);
+    ggml_tensor * t_feat = ggml_mish_fn(ctx, t_emb_b);                      // (TIME_DIM, B)
+    ggml_tensor * t_proj = ggml_add(ctx, ggml_mul_mat(ctx, w.mlp_w, t_feat),
+                                    w.mlp_b);                                // (C, B)
+    const int64_t B = t_proj->ne[1];
+    h = ggml_add(ctx, h, ggml_reshape_3d(ctx, t_proj, 1, C_out, B));
+    h = cfm_causal_block_b(ctx, h, w.b2_conv_w, w.b2_conv_b, w.b2_ln_w, w.b2_ln_b, C_out);
+    ggml_tensor * res = conv1d_f32_b(ctx, w.res_w, x, 1, 0, 1);
+    res = ggml_add(ctx, res, ggml_reshape_2d(ctx, w.res_b, 1, C_out));
+    return ggml_add(ctx, h, res);
+}
+
+static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
+                                 ggml_tensor * x, int T, int C, int B,
+                                 int H = 8, int HD = 64) {
+    int INNER = H * HD;
+    ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);            // (C, T, B)
+    ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);                        // (INNER, T, B)
+    ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
+    ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
+    // Zero-cont Q/K/V (see PROGRESS.md 3.14): express the
+    // (HD, T, H, B) layout expected by flash_attn_ext as a strided view
+    // on the already-contiguous (INNER, T, B) mul_mat output.
+    const size_t col_stride   = (size_t) INNER   * sizeof(float);
+    const size_t head_stride  = (size_t) HD      * sizeof(float);
+    const size_t batch_stride = (size_t) INNER * T * sizeof(float);
+    q = ggml_view_4d(ctx, q, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    k = ggml_view_4d(ctx, k, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    v = ggml_view_4d(ctx, v, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
+                                                1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
+    // flash_attn_ext output ne=[HD, H, T, B].  Reshape back to (INNER, T, B).
+    ggml_tensor * flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
+    ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
+    x = ggml_add(ctx, x, attn_out);
+
+    ggml_tensor * nx2 = layer_norm(ctx, x, w.norm3_w, w.norm3_b);
+    ggml_tensor * ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff0_w, nx2), w.ff0_b);
+    ff = ggml_gelu_erf(ctx, ff);
+    ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff2_w, ff), w.ff2_b);
+    return ggml_add(ctx, x, ff);
+}
+
+static ggml_tensor * apply_tfm_stack_b(ggml_context * ctx, const cfm_tfm_stack & s,
+                                       ggml_tensor * x, int T, int C, int B) {
+    ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));    // (C, T, B)
+    for (const auto & b : s.blocks) xt = basic_tfm_b(ctx, b, xt, T, C, B);
+    return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));               // (T, C, B)
+}
+
+static ggml_tensor * cfm_causal_k3_b(ggml_context * ctx, ggml_tensor * x,
+                                     ggml_tensor * w, ggml_tensor * b, int C_out) {
+    ggml_tensor * xp = zero_pad_dim0(ctx, x, 2, 0);
+    ggml_tensor * y = conv1d_f32_b(ctx, w, xp, 1, 0, 1);
     return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C_out));
 }
 
@@ -764,8 +908,18 @@ static std::vector<float> compute_time_mixed(const model_ctx & m,
 }
 
 // Cached CFM estimator state — graph is built once and reused across steps.
+//
+// Cache key is (T, b2): a graph built for batch=1 (cfm_estimator_forward) cannot
+// be reused for the batch=2 path (cfm_estimator_forward_b2) since the input
+// tensor layouts differ (ne[2] = 1 vs 2).  Today `use_b2` is constant per
+// `s3gen_synthesize_to_wav` invocation and the cache lives on the stack of
+// that one call, so a single key would be safe — but a future change that
+// switches modes mid-utterance (e.g. CFG warm-up where step 0 is single-pass
+// and steps 1+ are batched) would silently reuse a wrong-shape graph and
+// crash inside the allocator.
 struct cfm_estimator_cache {
-    int T = -1;
+    int  T  = -1;
+    bool b2 = false;
     ggml_context * ctx = nullptr;
     ggml_cgraph * gf = nullptr;
     ggml_gallocr_t allocr = nullptr;
@@ -790,21 +944,26 @@ static std::vector<float> cfm_estimator_forward(
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
 
-    const bool build_graph = (cache.T != T);
+    const bool build_graph = (cache.T != T) || cache.b2;
     if (build_graph) {
         if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
         if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
-        cache.buf.resize(256 * 1024 * 1024);
+        // 64 MB is comfortable headroom for ~1500 tensor headers + 65536-node
+        // graph metadata at no_alloc=true (the buffer holds tensor structs
+        // and graph book-keeping only, not weight data).  Was 256 MB before;
+        // dropped after measuring real usage at <8 MB and noticing that the
+        // virtual reservation was inflating RSS on systems without overcommit.
+        cache.buf.resize(64 * 1024 * 1024);
         ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
         cache.ctx = ggml_init(gp);
         cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
-        cache.T = T;
+        cache.T  = T;
+        cache.b2 = false;
     }
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-    if (!build_graph) goto compute_only;  // skip graph build, just update inputs and recompute
 
-    {
+    if (build_graph) {
 
     ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
     ggml_tensor * mu_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(mu_in, "mu_in"); ggml_set_input(mu_in);
@@ -873,7 +1032,6 @@ static std::vector<float> cfm_estimator_forward(
     // dispatch elsewhere in the pipeline (e.g. during T3→S3Gen transition)
     // so it overlaps with other host work, which is a bigger refactor.
 
-compute_only:
     ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mu_in"), mu.data(), 0, mu.size()*sizeof(float));
@@ -886,6 +1044,140 @@ compute_only:
     std::vector<float> out_data(ggml_nelements(out_t));
     ggml_backend_tensor_get(out_t, out_data.data(), 0, ggml_nbytes(out_t));
     return out_data;
+}
+
+// Single estimator forward, batch=2 — runs the conditional and unconditional
+// passes through the decoder in one shot.  Inputs are flat F32 vectors of
+// shape (T*MEL) or (MEL,) etc.; the `*_u` suffix carries the uncond copy.
+// Output is two dxdt vectors (cond, uncond) each of shape (T*MEL).
+//
+// Used by the non-meanflow (MTL) CFM loop to halve its per-utterance
+// estimator-call count — the expensive weight-tensor reads amortise across
+// both batch elements, so the pipeline gets close to a 2× speedup on CPU
+// where the decoder is memory-bandwidth bound.
+static void cfm_estimator_forward_b2(
+    const model_ctx & m,
+    cfm_estimator_cache & cache,
+    const std::vector<float> & x_c,     const std::vector<float> & x_u,
+    const std::vector<float> & mu_c,    const std::vector<float> & mu_u,
+    const std::vector<float> & t_emb_c, const std::vector<float> & t_emb_u,
+    const std::vector<float> & spks_c,  const std::vector<float> & spks_u,
+    const std::vector<float> & cond_c,  const std::vector<float> & cond_u,
+    std::vector<float> & out_c, std::vector<float> & out_u,
+    int T) {
+    const int MEL = 80, CH = 256, TIME_DIM = 1024;
+    const int N_MID = 12, N_BLOCKS = 4;
+    const int B = 2;
+
+    const bool build_graph = (cache.T != T) || !cache.b2;
+    if (build_graph) {
+        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+        if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
+        // 64 MB is plenty for 65536 graph nodes + ~3000 tensor headers (the
+        // batch=2 graph roughly doubles tensor count vs the batch=1 path).
+        // Was 512 MB before — see cfm_estimator_forward for the rationale on
+        // why the original number was overspec.
+        cache.buf.resize(64 * 1024 * 1024);
+        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+        cache.ctx = ggml_init(gp);
+        cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
+        cache.T  = T;
+        cache.b2 = true;
+    }
+    ggml_context * ctx = cache.ctx;
+    ggml_cgraph * gf = cache.gf;
+
+    if (build_graph) {
+
+    ggml_tensor * x_in    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(x_in, "x_in");       ggml_set_input(x_in);
+    ggml_tensor * mu_in   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(mu_in, "mu_in");     ggml_set_input(mu_in);
+    ggml_tensor * spks_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, MEL, B);    ggml_set_name(spks_in, "spks_in"); ggml_set_input(spks_in);
+    ggml_tensor * cond_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(cond_in, "cond_in"); ggml_set_input(cond_in);
+    ggml_tensor * t_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, TIME_DIM, B); ggml_set_name(t_emb_in, "t_emb"); ggml_set_input(t_emb_in);
+
+    // Broadcast spks (MEL, B) over T → (T, MEL, B).
+    ggml_tensor * spks_bc = ggml_repeat(ctx,
+        ggml_reshape_3d(ctx, spks_in, 1, MEL, B), x_in);
+    ggml_tensor * xc = ggml_concat(ctx, x_in, mu_in, 1);
+    xc = ggml_concat(ctx, xc, spks_bc, 1);
+    xc = ggml_concat(ctx, xc, cond_in, 1);
+
+    auto down_rn = load_cfm_resnet(m, "cfm/down_blocks/0/0");
+    auto down_tfms = load_tfm_stack(m, "cfm/down_blocks/0/1", N_BLOCKS);
+    ggml_tensor * down_conv_w = find_tensor(m, "cfm/down_blocks/0/2/weight");
+    ggml_tensor * down_conv_b = find_tensor(m, "cfm/down_blocks/0/2/bias");
+
+    ggml_tensor * z = cfm_resnet_b(ctx, down_rn, xc, t_emb_in, CH);
+    z = apply_tfm_stack_b(ctx, down_tfms, z, T, CH, B);
+    ggml_tensor * hidden = z;
+    z = cfm_causal_k3_b(ctx, z, down_conv_w, down_conv_b, CH);
+
+    for (int i = 0; i < N_MID; ++i) {
+        auto rn = load_cfm_resnet(m, "cfm/mid_blocks/" + std::to_string(i) + "/0");
+        auto tfms = load_tfm_stack(m, "cfm/mid_blocks/" + std::to_string(i) + "/1", N_BLOCKS);
+        z = cfm_resnet_b(ctx, rn, z, t_emb_in, CH);
+        z = apply_tfm_stack_b(ctx, tfms, z, T, CH, B);
+    }
+
+    auto up_rn = load_cfm_resnet(m, "cfm/up_blocks/0/0");
+    auto up_tfms = load_tfm_stack(m, "cfm/up_blocks/0/1", N_BLOCKS);
+    ggml_tensor * up_conv_w = find_tensor(m, "cfm/up_blocks/0/2/weight");
+    ggml_tensor * up_conv_b = find_tensor(m, "cfm/up_blocks/0/2/bias");
+    z = ggml_concat(ctx, z, hidden, 1);
+    z = cfm_resnet_b(ctx, up_rn, z, t_emb_in, CH);
+    z = apply_tfm_stack_b(ctx, up_tfms, z, T, CH, B);
+    z = cfm_causal_k3_b(ctx, z, up_conv_w, up_conv_b, CH);
+
+    ggml_tensor * fb_conv_w = find_tensor(m, "cfm/final_block/block/0/weight");
+    ggml_tensor * fb_conv_b = find_tensor(m, "cfm/final_block/block/0/bias");
+    ggml_tensor * fb_ln_w   = find_tensor(m, "cfm/final_block/block/2/weight");
+    ggml_tensor * fb_ln_b   = find_tensor(m, "cfm/final_block/block/2/bias");
+    z = cfm_causal_block_b(ctx, z, fb_conv_w, fb_conv_b, fb_ln_w, fb_ln_b, CH);
+
+    ggml_tensor * fp_w = find_tensor(m, "cfm/final_proj/weight");
+    ggml_tensor * fp_b = find_tensor(m, "cfm/final_proj/bias");
+    ggml_tensor * out = conv1d_f32_b(ctx, fp_w, z, 1, 0, 1);
+    out = ggml_add(ctx, out, ggml_reshape_2d(ctx, fp_b, 1, MEL));
+    ggml_set_name(out, "out"); ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(cache.allocr, gf);
+    }
+
+    ggml_gallocr_alloc_graph(cache.allocr, gf);
+
+    // Stage inputs: cond slice [0, T*MEL), uncond slice [T*MEL, 2*T*MEL).
+    const size_t one_tm = (size_t) T * MEL * sizeof(float);
+    const size_t one_m  = (size_t) MEL * sizeof(float);
+    const size_t one_td = (size_t) TIME_DIM * sizeof(float);
+
+    ggml_tensor * x_t    = ggml_graph_get_tensor(gf, "x_in");
+    ggml_tensor * mu_t   = ggml_graph_get_tensor(gf, "mu_in");
+    ggml_tensor * spks_t = ggml_graph_get_tensor(gf, "spks_in");
+    ggml_tensor * cond_t = ggml_graph_get_tensor(gf, "cond_in");
+    ggml_tensor * te_t   = ggml_graph_get_tensor(gf, "t_emb");
+
+    ggml_backend_tensor_set(x_t,     x_c.data(),     0 * one_tm, one_tm);
+    ggml_backend_tensor_set(x_t,     x_u.data(),     1 * one_tm, one_tm);
+    ggml_backend_tensor_set(mu_t,    mu_c.data(),    0 * one_tm, one_tm);
+    ggml_backend_tensor_set(mu_t,    mu_u.data(),    1 * one_tm, one_tm);
+    ggml_backend_tensor_set(cond_t,  cond_c.data(),  0 * one_tm, one_tm);
+    ggml_backend_tensor_set(cond_t,  cond_u.data(),  1 * one_tm, one_tm);
+    ggml_backend_tensor_set(spks_t,  spks_c.data(),  0 * one_m,  one_m);
+    ggml_backend_tensor_set(spks_t,  spks_u.data(),  1 * one_m,  one_m);
+    ggml_backend_tensor_set(te_t,    t_emb_c.data(), 0 * one_td, one_td);
+    ggml_backend_tensor_set(te_t,    t_emb_u.data(), 1 * one_td, one_td);
+
+    compute(m.backend, gf);
+
+    ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
+    // out_t ne=[T, MEL, B=2], contiguous.  Read cond/uncond halves separately.
+    const size_t half_bytes = (size_t) T * MEL * sizeof(float);
+    out_c.resize(T * MEL);
+    out_u.resize(T * MEL);
+    ggml_backend_tensor_get(out_t, out_c.data(), 0,           half_bytes);
+    ggml_backend_tensor_get(out_t, out_u.data(), half_bytes,  half_bytes);
 }
 
 // ============================================================================
@@ -1621,19 +1913,23 @@ int s3gen_synthesize_to_wav(
         fprintf(stderr, "  [mu vs step0_mu] max_abs=%.4e rms=%.4e vs ref\n", ma, std::sqrt(rsum / nm));
     }
 
-    // 6) For meanflow: z = randn(80, T_mu); then z[:, prompt_len:] = noised_mels (randn(80, T_speech*2))
-    vlog("Initializing CFM noise (seed=%d, meanflow)...\n", seed);
+    // 6) Initial CFM noise.  Layout mirrors Python: z has shape (80, T_mu).
+    //
+    //  - meanflow (Turbo):   randn everywhere, then replace the speech region
+    //                        with a second independent randn draw (matches
+    //                        `flow_matching.forward`'s `noised_mels` overlay).
+    //  - standard CFM (MTL): randn(80, T_mu) once; no overlay.  The speech
+    //                        region is implicitly conditioned through `cond`
+    //                        instead of via an extra noise tensor.
+    const bool meanflow = m.meanflow;
+    vlog("Initializing CFM noise (seed=%d, %s)...\n", seed,
+            meanflow ? "meanflow" : "standard CFM + CFG");
     std::vector<float> z(T_mu * MEL);
     int n_speech_part = 2 * (int)padded.size();
     int prompt_len_in_mu = T_mu - n_speech_part;
     vlog("  T_mu=%d prompt_len_in_mu=%d n_speech_part=%d\n",
             T_mu, prompt_len_in_mu, n_speech_part);
     if (!opts.cfm_z0_override.empty()) {
-        // Streaming validation path: use the exact noise Python used for
-        // this chunk so we can get bit-exact mel parity.  This override must
-        // be the FINAL z passed to the CFM estimator (i.e. including the
-        // speech-region overwrite that flow_matching.forward applies when
-        // `noised_mels` is not None in meanflow mode).
         if ((int64_t)opts.cfm_z0_override.size() != (int64_t)T_mu * MEL) {
             fprintf(stderr, "error: cfm_z0_override has %zu elements but T_mu*MEL=%d\n",
                     opts.cfm_z0_override.size(), T_mu * MEL);
@@ -1642,16 +1938,14 @@ int s3gen_synthesize_to_wav(
         std::memcpy(z.data(), opts.cfm_z0_override.data(), z.size() * sizeof(float));
         fprintf(stderr, "  [stream] loaded %zu elems of CFM z0 from cfm_z0_override\n",
                 opts.cfm_z0_override.size());
-    } else if (debug_mode) {
+    } else if (debug_mode && meanflow) {
         npy_array z_npy = npy_load(ref_dir + "/cfm_z0_raw.npy");
         std::memcpy(z.data(), z_npy.data.data(), z.size() * sizeof(float));
         fprintf(stderr, "  [debug] loaded z from cfm_z0_raw.npy\n");
-        // Overwrite z[:, prompt_len:] with noised_mels
         npy_array nm_npy = npy_load(ref_dir + "/cfm_noised_mels.npy");
         const float * nm = (const float*)nm_npy.data.data();
         int nm_T = (int)nm_npy.shape[1];
         fprintf(stderr, "  [debug] overlay noised_mels (80, %d) at pos %d\n", nm_T, prompt_len_in_mu);
-        // z ne=[T_mu, MEL]; write rows [prompt_len_in_mu .. prompt_len_in_mu+nm_T) of each channel
         for (int m2 = 0; m2 < MEL; ++m2)
             for (int t = 0; t < nm_T; ++t)
                 z[m2 * T_mu + (prompt_len_in_mu + t)] = nm[m2 * nm_T + t];
@@ -1659,24 +1953,47 @@ int s3gen_synthesize_to_wav(
         std::mt19937 rng(seed);
         std::normal_distribution<float> gauss(0.0f, 1.0f);
         for (size_t i = 0; i < z.size(); ++i) z[i] = gauss(rng);
-        // For meanflow production, also resample the non-prompt region independently:
-        // (Python: noise = torch.randn(1, 80, speech_tokens.size(-1)*2); z[..., prompt_len:] = noise)
-        std::mt19937 rng2(seed + 2);
-        std::normal_distribution<float> gauss2(0.0f, 1.0f);
-        for (int m2 = 0; m2 < MEL; ++m2)
-            for (int t = prompt_len_in_mu; t < T_mu; ++t)
-                z[m2 * T_mu + t] = gauss2(rng2);
+        if (meanflow) {
+            std::mt19937 rng2(seed + 2);
+            std::normal_distribution<float> gauss2(0.0f, 1.0f);
+            for (int m2 = 0; m2 < MEL; ++m2)
+                for (int t = prompt_len_in_mu; t < T_mu; ++t)
+                    z[m2 * T_mu + t] = gauss2(rng2);
+        }
     }
 
-    // 7) CFM loop: default 2-step meanflow (t_span = [0, 0.5, 1]); streaming
-    // callers can override via opts.cfm_steps = 1 for a single Euler jump
-    // (~2× CFM speedup at the cost of a small quality degradation — Turbo
-    // is meanflow-trained so 1-step is a valid sampling mode, just noisier).
+    // 7) CFM loop.
+    //  - meanflow:      t_span linearly spaced on [0,1], default 2 steps,
+    //                   one estimator call per step, t_emb mixed with r via
+    //                   the meanflow-only time_embed_mixer.
+    //  - standard CFM:  t_span cosine-scheduled, default 10 steps, two
+    //                   estimator calls per step (cond + uncond with zeroed
+    //                   mu/spks/cond) combined via cfg_rate.
     std::vector<float> t_span;
-    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : 2;
+    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps :
+                          (meanflow ? 2 : m.n_timesteps);
     t_span.reserve(cfm_steps + 1);
-    for (int i = 0; i <= cfm_steps; ++i)
-        t_span.push_back((float)i / (float)cfm_steps);
+    for (int i = 0; i <= cfm_steps; ++i) {
+        float tau = (float)i / (float)cfm_steps;
+        if (!meanflow) {
+            tau = 1.0f - std::cos(tau * 0.5f * (float)M_PI);
+        }
+        t_span.push_back(tau);
+    }
+
+    const float cfg_rate = m.cfg_rate;
+    const std::vector<float> zero_mu  (T_mu * MEL, 0.0f);
+    const std::vector<float> zero_cond(T_mu * MEL, 0.0f);
+    const std::vector<float> zero_spks(MEL, 0.0f);
+    // Pack cond + uncond into one batch=2 forward call on GPU backends so
+    // their per-dispatch overhead amortises across both passes.  On ggml-cpu
+    // the dispatch overhead is already ~zero and the extra permute+cont ops
+    // that a batched attention block needs in each layer actually regress
+    // throughput (measured +11% S3Gen wall time on M4 CPU), so we keep the
+    // two-call path there.  Meanflow has no CFG to begin with.
+    const bool use_b2 = (!meanflow) && (cfg_rate != 0.0f) &&
+                        !ggml_backend_is_cpu(m.backend);
+
     cfm_estimator_cache cfm_cache;
     double cfm_t0 = now_ms();
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
@@ -1684,10 +2001,15 @@ int s3gen_synthesize_to_wav(
         float dt = r - t;
         vlog("CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
         auto t_mlp = compute_time_mlp(m, t);
-        auto r_mlp = compute_time_mlp(m, r);
-        auto t_emb = compute_time_mixed(m, t_mlp, r_mlp);
+        std::vector<float> t_emb;
+        if (meanflow) {
+            auto r_mlp = compute_time_mlp(m, r);
+            t_emb = compute_time_mixed(m, t_mlp, r_mlp);
+        } else {
+            t_emb = std::move(t_mlp);
+        }
 
-        if (debug_mode) {
+        if (debug_mode && meanflow) {
             npy_array ref = npy_load(ref_dir + "/cfm_t_mix_call" + std::to_string(s) + ".npy");
             const float * r_ = (const float*)ref.data.data();
             size_t n = std::min(t_emb.size(), ref.n_elements());
@@ -1695,7 +2017,6 @@ int s3gen_synthesize_to_wav(
             for (size_t i = 0; i < n; ++i) { float d = t_emb[i] - r_[i]; ma = std::max(ma, std::fabs(d)); rsum += d*d; }
             fprintf(stderr, "    [t_emb step%zu] max_abs=%.4e rms=%.4e vs ref\n", s, ma, std::sqrt(rsum / n));
 
-            // Dump my x_in and see if it matches reference cfm_step{s}_x_in.npy
             npy_array ref_x = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_x_in.npy");
             const float * rx = (const float*)ref_x.data.data();
             size_t nx = std::min(z.size(), ref_x.n_elements());
@@ -1705,10 +2026,26 @@ int s3gen_synthesize_to_wav(
         }
 
         double step_t0 = now_ms();
-        auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
+        std::vector<float> dxdt_cond;
+        if (use_b2) {
+            std::vector<float> dxdt_uncond;
+            cfm_estimator_forward_b2(m, cfm_cache,
+                z, z,
+                mu, zero_mu,
+                t_emb, t_emb,
+                spks, zero_spks,
+                cond, zero_cond,
+                dxdt_cond, dxdt_uncond, T_mu);
+            for (size_t i = 0; i < dxdt_cond.size(); ++i) {
+                dxdt_cond[i] = (1.0f + cfg_rate) * dxdt_cond[i] - cfg_rate * dxdt_uncond[i];
+            }
+        } else {
+            dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
+        }
+        auto & dxdt = dxdt_cond;
         vlog("  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
 
-        if (debug_mode) {
+        if (debug_mode && meanflow) {
             npy_array ref = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_dxdt.npy");
             const float * r_ = (const float*)ref.data.data();
             size_t n = std::min(dxdt.size(), ref.n_elements());
@@ -1717,7 +2054,6 @@ int s3gen_synthesize_to_wav(
             fprintf(stderr, "    [dxdt step%zu] max_abs=%.4e rms=%.4e vs ref\n", s, ma, std::sqrt(rsum / n));
         }
 
-        // Streaming: dump step0 dxdt for per-chunk bisection.
         if (s == 0 && !opts.dump_mel_path.empty()) {
             std::string base = opts.dump_mel_path;
             if (base.size() > 4 && base.substr(base.size() - 4) == ".npy")

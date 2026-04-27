@@ -37,11 +37,16 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
         return false;
     }
 
+    auto cleanup = [&](bool ok) {
+        gguf_free(g);
+        if (tmp_ctx) ggml_free(tmp_ctx);
+        return ok;
+    };
+
     // Presence check: the VE weights landed in Phase 2c of the A1 plan, so a
     // pre-A1 GGUF won't have them.  Bail cleanly.
     if (gguf_find_key(g, "voice_encoder.hidden_size") < 0) {
-        gguf_free(g); if (tmp_ctx) ggml_free(tmp_ctx);
-        return false;
+        return cleanup(false);
     }
 
     auto get_u32 = [&](const char * k, uint32_t fallback) -> uint32_t {
@@ -62,6 +67,13 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
     out.rate           = get_f32("voice_encoder.rate",               1.3f);
     out.min_coverage   = get_f32("voice_encoder.min_coverage",       0.8f);
 
+    auto load_or_fail = [&](const char * name, std::vector<float> & dst) {
+        if (copy_tensor_f32(tmp_ctx, name, dst)) return true;
+        fprintf(stderr, "voice_encoder_load: missing expected tensor '%s' in %s\n",
+                name, t3_gguf_path.c_str());
+        return false;
+    };
+
     out.lstm.clear();
     out.lstm.resize(out.n_layers);
     for (int l = 0; l < out.n_layers; ++l) {
@@ -70,25 +82,19 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
         L.I = (l == 0) ? out.n_mels : out.hidden;
         char name[128];
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/weight_ih_l%d", l);
-        if (!copy_tensor_f32(tmp_ctx, name, L.w_ih)) goto fail;
+        if (!load_or_fail(name, L.w_ih)) return cleanup(false);
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/weight_hh_l%d", l);
-        if (!copy_tensor_f32(tmp_ctx, name, L.w_hh)) goto fail;
+        if (!load_or_fail(name, L.w_hh)) return cleanup(false);
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/bias_ih_l%d", l);
-        if (!copy_tensor_f32(tmp_ctx, name, L.b_ih)) goto fail;
+        if (!load_or_fail(name, L.b_ih)) return cleanup(false);
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/bias_hh_l%d", l);
-        if (!copy_tensor_f32(tmp_ctx, name, L.b_hh)) goto fail;
+        if (!load_or_fail(name, L.b_hh)) return cleanup(false);
     }
-    if (!copy_tensor_f32(tmp_ctx, "voice_encoder/proj/weight", out.proj_w)) goto fail;
-    if (!copy_tensor_f32(tmp_ctx, "voice_encoder/proj/bias",   out.proj_b)) goto fail;
-    if (!copy_tensor_f32(tmp_ctx, "voice_encoder/mel_fb",      out.mel_fb)) goto fail;
+    if (!load_or_fail("voice_encoder/proj/weight", out.proj_w)) return cleanup(false);
+    if (!load_or_fail("voice_encoder/proj/bias",   out.proj_b)) return cleanup(false);
+    if (!load_or_fail("voice_encoder/mel_fb",      out.mel_fb)) return cleanup(false);
 
-    gguf_free(g); if (tmp_ctx) ggml_free(tmp_ctx);
-    return true;
-
-fail:
-    fprintf(stderr, "voice_encoder_load: missing expected tensor in %s\n", t3_gguf_path.c_str());
-    gguf_free(g); if (tmp_ctx) ggml_free(tmp_ctx);
-    return false;
+    return cleanup(true);
 }
 
 // ============================================================================
