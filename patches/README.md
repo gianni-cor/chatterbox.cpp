@@ -100,6 +100,7 @@ OpenCL (e.g. Qualcomm Adreno) instead of failing on missing ops:
 | `CONV_TRANSPOSE_1D` | f32 and f16-kernel + f32 input kernels, dispatch + `supports_op` |
 | `GGML_OP_SIN` | `sin.cl` (element-wise), dispatch + `supports_op` |
 | `GGML_OP_LEAKY_RELU` | `kernel_leaky_relu` in `relu.cl`, dispatch + `supports_op` |
+| `GGML_UNARY_OP_ABS`, `GGML_UNARY_OP_ELU` | f32 unary kernels for the HiFT f0 predictor path |
 | `ggml-opencl.h` | Document that `ggml_backend_opencl_init` may return NULL when no device |
 | Build | Register new `.cl` sources in `CMakeLists.txt` for embed |
 
