@@ -1,5 +1,5 @@
-#include "qvac-tts/qvac-tts.h"
+#include "tts-cpp/tts-cpp.h"
 
 int main(int argc, char ** argv) {
-    return qvac_tts_cli_main(argc, argv);
+    return tts_cpp_cli_main(argc, argv);
 }

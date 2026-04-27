@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(qvac-tts-cpp LANGUAGES C CXX VERSION 0.1.0)
+project(tts-cpp LANGUAGES C CXX VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,19 +7,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(GNUInstallDirs)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    set(QVAC_TTS_STANDALONE_DEFAULT ON)
+    set(TTS_CPP_STANDALONE_DEFAULT ON)
 else()
-    set(QVAC_TTS_STANDALONE_DEFAULT OFF)
+    set(TTS_CPP_STANDALONE_DEFAULT OFF)
 endif()
 
-option(QVAC_TTS_BUILD_LIBRARY     "qvac-tts: build the static qvac-tts library"                 ON)
-option(QVAC_TTS_BUILD_EXECUTABLES "qvac-tts: build the qvac-tts CLI + mel2wav demo"             ${QVAC_TTS_STANDALONE_DEFAULT})
-option(QVAC_TTS_BUILD_TESTS       "qvac-tts: build per-stage numerical validation harnesses"    ${QVAC_TTS_STANDALONE_DEFAULT})
-option(QVAC_TTS_INSTALL           "qvac-tts: generate install rules"                            ON)
-option(QVAC_TTS_USE_SYSTEM_GGML   "qvac-tts: use system-installed GGML library"                 OFF)
+option(TTS_CPP_BUILD_LIBRARY     "tts-cpp: build the static tts-cpp library"                 ON)
+option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cli executable + mel2wav demo"     ${TTS_CPP_STANDALONE_DEFAULT})
+option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
+option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
+option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use system-installed GGML library"                OFF)
 
 if (NOT TARGET ggml)
-    if (QVAC_TTS_USE_SYSTEM_GGML)
+    if (TTS_CPP_USE_SYSTEM_GGML)
         find_package(ggml CONFIG REQUIRED)
         if (NOT ggml_FOUND)
             message(FATAL_ERROR "System-installed GGML library not found.")
@@ -32,8 +32,9 @@ endif()
 
 find_package(OpenMP)
 
-set(QVAC_TTS_LIB_SOURCES
+set(TTS_CPP_LIB_SOURCES
     src/main.cpp
+    src/chatterbox_cli.cpp
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
     src/chatterbox_engine.cpp
@@ -49,11 +50,11 @@ add_library(mtl_tokenizer STATIC src/mtl_tokenizer.cpp)
 target_include_directories(mtl_tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set_target_properties(mtl_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-if (QVAC_TTS_BUILD_LIBRARY)
-    add_library(qvac-tts STATIC ${QVAC_TTS_LIB_SOURCES})
-    add_library(qvac-tts::qvac-tts ALIAS qvac-tts)
+if (TTS_CPP_BUILD_LIBRARY)
+    add_library(tts-cpp STATIC ${TTS_CPP_LIB_SOURCES})
+    add_library(tts-cpp::tts-cpp ALIAS tts-cpp)
 
-    target_include_directories(qvac-tts
+    target_include_directories(tts-cpp
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -61,44 +62,50 @@ if (QVAC_TTS_BUILD_LIBRARY)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
     )
-    target_link_libraries(qvac-tts PUBLIC ggml)
-    target_link_libraries(qvac-tts PRIVATE mtl_tokenizer)
+    target_compile_features(tts-cpp PUBLIC cxx_std_17)
+    target_link_libraries(tts-cpp PUBLIC ggml)
+    target_link_libraries(tts-cpp PRIVATE mtl_tokenizer)
 
     if (OpenMP_CXX_FOUND)
-        target_link_libraries(qvac-tts PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(tts-cpp PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
     if (GGML_CUDA)
-        target_compile_definitions(qvac-tts PRIVATE GGML_USE_CUDA)
+        target_compile_definitions(tts-cpp PRIVATE GGML_USE_CUDA)
     endif()
     if (GGML_METAL)
-        target_compile_definitions(qvac-tts PRIVATE GGML_USE_METAL)
+        target_compile_definitions(tts-cpp PRIVATE GGML_USE_METAL)
     endif()
     if (GGML_VULKAN)
-        target_compile_definitions(qvac-tts PRIVATE GGML_USE_VULKAN)
+        target_compile_definitions(tts-cpp PRIVATE GGML_USE_VULKAN)
+    endif()
+    if (GGML_OPENCL)
+        target_compile_definitions(tts-cpp PRIVATE GGML_USE_OPENCL)
     endif()
 
-    set_target_properties(qvac-tts PROPERTIES
+    set_target_properties(tts-cpp PROPERTIES
         POSITION_INDEPENDENT_CODE ON
-        EXPORT_NAME qvac-tts
+        EXPORT_NAME tts-cpp
     )
 endif()
 
-if (QVAC_TTS_BUILD_EXECUTABLES)
-    if (NOT QVAC_TTS_BUILD_LIBRARY)
-        message(FATAL_ERROR "QVAC_TTS_BUILD_EXECUTABLES requires QVAC_TTS_BUILD_LIBRARY=ON")
+if (TTS_CPP_BUILD_EXECUTABLES)
+    if (NOT TTS_CPP_BUILD_LIBRARY)
+        message(FATAL_ERROR "TTS_CPP_BUILD_EXECUTABLES requires TTS_CPP_BUILD_LIBRARY=ON")
     endif()
 
-    add_executable(qvac-tts-cli src/cli_main.cpp)
-    target_link_libraries(qvac-tts-cli PRIVATE qvac-tts)
-    set_target_properties(qvac-tts-cli PROPERTIES OUTPUT_NAME qvac-tts)
+    add_executable(tts-cli src/cli_main.cpp)
+    target_link_libraries(tts-cli PRIVATE tts-cpp)
+
+    add_executable(chatterbox src/cli_main.cpp)
+    target_link_libraries(chatterbox PRIVATE tts-cpp)
 
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
     target_include_directories(mel2wav PRIVATE ggml/include src)
 endif()
 
-if (QVAC_TTS_BUILD_TESTS)
+if (TTS_CPP_BUILD_TESTS)
     add_executable(test-s3gen src/test_s3gen.cpp)
     target_link_libraries(test-s3gen PRIVATE ggml)
     target_include_directories(test-s3gen PRIVATE ggml/include src)
@@ -163,14 +170,14 @@ if (QVAC_TTS_BUILD_TESTS)
     target_include_directories(test-mtl-tokenizer PRIVATE src)
 
     add_executable(test-t3-mtl src/test_t3_mtl.cpp)
-    target_link_libraries(test-t3-mtl PRIVATE qvac-tts ggml)
+    target_link_libraries(test-t3-mtl PRIVATE tts-cpp ggml)
     target_include_directories(test-t3-mtl PRIVATE ggml/include src include)
     if (GGML_METAL)
         target_compile_definitions(test-t3-mtl PRIVATE GGML_USE_METAL)
     endif()
 
     add_executable(test-t3-mtl-stages src/test_t3_mtl_stages.cpp)
-    target_link_libraries(test-t3-mtl-stages PRIVATE qvac-tts ggml)
+    target_link_libraries(test-t3-mtl-stages PRIVATE tts-cpp ggml)
     target_include_directories(test-t3-mtl-stages PRIVATE ggml/include src include)
     if (GGML_METAL)
         target_compile_definitions(test-t3-mtl-stages PRIVATE GGML_USE_METAL)
@@ -190,19 +197,59 @@ if (QVAC_TTS_BUILD_TESTS)
     endif()
 endif()
 
-if (QVAC_TTS_INSTALL AND QVAC_TTS_BUILD_LIBRARY)
-    install(TARGETS qvac-tts
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
-    install(DIRECTORY include/qvac-tts
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-        FILES_MATCHING PATTERN "*.h"
-    )
-    install(FILES
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-tts-cppConfig.cmake
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-tts-cppConfigVersion.cmake
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/qvac-tts-cpp
-    )
+if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
+    if (TTS_CPP_USE_SYSTEM_GGML)
+        # Full install(EXPORT) flow.  Only reachable when `ggml` is an
+        # imported target from `find_package(ggml CONFIG REQUIRED)` — the
+        # standalone `add_subdirectory(ggml)` path would fail
+        # install(EXPORT) because its ggml target isn't in an export set.
+        include(CMakePackageConfigHelpers)
+
+        install(TARGETS tts-cpp
+            EXPORT tts-cppTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        )
+        install(DIRECTORY include/tts-cpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            FILES_MATCHING PATTERN "*.h"
+        )
+        install(EXPORT tts-cppTargets
+            FILE tts-cppTargets.cmake
+            NAMESPACE tts-cpp::
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+        )
+        configure_package_config_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tts-cppConfig.cmake.in
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
+            INSTALL_DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+        )
+        write_basic_package_version_file(
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
+            VERSION ${PROJECT_VERSION}
+            COMPATIBILITY SameMinorVersion
+        )
+        install(FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+        )
+    else()
+        # Standalone build: install the archive + headers, but skip the
+        # Config.cmake / Targets.cmake export set since the in-tree
+        # `ggml` target can't be exported without also exporting its
+        # whole subdirectory.  Downstream library-first consumers build
+        # with TTS_CPP_USE_SYSTEM_GGML=ON and get the full Config.cmake.
+        install(TARGETS tts-cpp
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+        install(DIRECTORY include/tts-cpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            FILES_MATCHING PATTERN "*.h"
+        )
+    endif()
 endif()

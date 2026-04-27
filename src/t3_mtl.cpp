@@ -39,6 +39,8 @@
 #include <string>
 #include <vector>
 
+namespace tts_cpp::chatterbox::detail {
+
 namespace {
 
 int64_t require_key(const gguf_context * ctx, const char * key) {
@@ -1007,3 +1009,5 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     }
     return (int32_t)(V - 1);
 }
+
+} // namespace tts_cpp::chatterbox::detail

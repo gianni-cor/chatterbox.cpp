@@ -3,14 +3,17 @@
 // Library-internal declarations for the T3 (GPT-2 Medium autoregressive
 // text -> speech tokens) front-half of the Chatterbox pipeline.  Shared
 // between src/main.cpp (CLI) and src/chatterbox_engine.cpp (public engine
-// API under include/qvac-tts/chatterbox/engine.h).
+// API under include/tts-cpp/chatterbox/engine.h).
 //
 // This header is NOT installed with the library (see CMakeLists.txt
 // install rules) — it's part of the implementation, not the public
-// surface.  Public consumers should use <qvac-tts/chatterbox/engine.h>.
+// surface.  Public consumers should use <tts-cpp/chatterbox/engine.h>.
 //
-// Names stay in the global namespace to keep main.cpp's diff minimal
-// during the extraction (main.cpp had them as static globals/functions).
+// Everything lives in `tts_cpp::chatterbox::detail` so the library's
+// compiled object files do not export generic names like
+// `load_model_gguf` / `eval_prompt` / `g_log_verbose` into the global
+// linker namespace where they would collide with sibling ML libraries
+// (llama.cpp, whisper.cpp, stable-diffusion.cpp).
 
 #include <cstdint>
 #include <map>
@@ -21,6 +24,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+
+namespace tts_cpp::chatterbox::detail {
 
 constexpr int CHBX_MAX_NODES = 8192;
 
@@ -293,3 +298,5 @@ int32_t sample_next_token_mtl(
     const std::vector<int32_t> &       generated,
     const chatterbox_sampling_params & params,
     std::mt19937 &                     rng);
+
+} // namespace tts_cpp::chatterbox::detail

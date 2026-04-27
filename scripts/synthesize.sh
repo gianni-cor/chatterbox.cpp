@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end text -> wav synthesis using the unified chatterbox binary
+# End-to-end text -> wav synthesis using the unified tts-cli binary
 # (text -> T3 speech tokens -> S3Gen + HiFT vocoder -> 24 kHz wav).
 #
 # Usage:
@@ -19,12 +19,12 @@ shift 2
 EXTRA_ARGS="$*"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/build/chatterbox"
+BIN="$ROOT/build/tts-cli"
 T3_GGUF="$ROOT/models/chatterbox-t3-turbo.gguf"
 S3G_GGUF="$ROOT/models/chatterbox-s3gen.gguf"
 
 if [[ ! -x "$BIN" ]]; then
-    echo "error: $BIN not built; run 'cmake --build build --target chatterbox' first" >&2
+    echo "error: $BIN not built; run 'cmake --build build --target tts-cli' first" >&2
     exit 1
 fi
 for f in "$T3_GGUF" "$S3G_GGUF"; do

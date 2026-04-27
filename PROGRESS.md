@@ -15,15 +15,14 @@ end-to-end CPU binary, in the order things actually happened.
 
 ## Current status (end of journey)
 
-Everything runs in pure C++/ggml on CPU. Three binaries:
+Everything runs in pure C++/ggml on CPU. The main end-to-end tool is one binary:
 
 | Binary | Role |
 |--------|------|
-| `chatterbox` | text → speech tokens (T3, GPT-2 Medium, 24 layers) |
-| `chatterbox-tts` | speech tokens + reference voice → 24 kHz wav (S3Gen + HiFT) |
+| `tts-cli` | end-to-end: text → speech tokens (T3) → 24 kHz wav (S3Gen + HiFT); voice cloning, streaming, etc. |
 | `mel2wav` | mel spectrogram → wav (HiFT only, demo) |
 
-Plus `scripts/synthesize.sh` which composes the two into a single command.
+Plus `scripts/synthesize.sh`, a thin wrapper around `tts-cli`.
 
 **Numerical parity vs PyTorch** on a 2.7 s reference utterance, debug mode
 (Python-dumped random bits substituted for reproducibility):
@@ -64,7 +63,8 @@ chatterbox.cpp/
                                       during setup; see patches/README.md)
     README.md                         why each patch exists + how to drop it
   src/
-    main.cpp                      T3 runtime + unified CLI (chatterbox binary)
+    main.cpp                      T3 runtime + shared helpers (libtts-cpp; tts-cli links this)
+    chatterbox_cli.cpp            unified CLI (tts-cli binary)
     chatterbox_tts.cpp            S3Gen encoder + CFM + HiFT (reusable entry)
     gpt2_bpe.{h,cpp}              self-contained GPT-2 byte-level BPE tokenizer
     voice_features.{h,cpp}        wav I/O, resample, mel, fbank, LUFS
@@ -84,7 +84,7 @@ chatterbox.cpp/
     dump-s3tokenizer-reference.py     PyTorch → .npy intermediates for test-s3tokenizer
     reference-t3-turbo.py             PyTorch T3 + compare against C++
     compare-tokenizer.py              10-case tokenizer comparison against HF
-    synthesize.sh                     text → wav wrapper (chatterbox binary)
+    synthesize.sh                     text → wav wrapper (tts-cli)
   models/
     chatterbox-t3-turbo.gguf      T3 + tokenizer conditionals
     chatterbox-s3gen.gguf         flow + mel2wav weights + built-in voice
@@ -139,7 +139,7 @@ tokens + voice conditioning to speech tokens.
   `punc_norm` matching the Python implementation. **10/10** test cases match
   the HF tokenizer byte-for-byte, including the 19 paralinguistic added tokens
   (`[laugh]`, `[chuckle]`, …).
-- `chatterbox` binary takes `--text` + `--tokenizer-dir` and produces speech
+- `tts-cli` takes `--text` + `--tokenizer-dir` and produces speech
   tokens end-to-end.
 
 Verified against PyTorch: **bit-for-bit** identical speech tokens on 4
@@ -261,8 +261,8 @@ Final plumbing: write `src/chatterbox_tts.cpp` that wires the S3Gen encoder →
 speech tokens plus a reference voice (`embedding`, `prompt_token`,
 `prompt_feat`).
 
-`scripts/synthesize.sh` runs `chatterbox` → pipe tokens → `chatterbox-tts`,
-giving a single-command `text → wav` path.
+Historically `synthesize.sh` piped two binaries; today one `tts-cli` runs the
+full pipeline, and `synthesize.sh` is a thin wrapper around it.
 
 Debug mode (`--debug`) substitutes Python-dumped reference random bits (CFM
 `z` and `noised_mels`) so the deterministic parts can be validated
@@ -982,7 +982,7 @@ does:
      normalises so the speaker embedding doesn't drift on the
      shouted-vs-whispered axis.
 5. Emit `voices/<name>.wav` at 24 kHz mono s16le.
-6. Optionally call `./build/chatterbox --save-voice` to bake the
+6. Optionally call `./build/tts-cli --save-voice` to bake the
    five `.npy` tensors.
 
 Commit: `84d2189`.
@@ -1387,7 +1387,7 @@ Staged pipeline:
    `max_abs / mean_abs / rms / max|ref| / rel`.
 3. For T3 we additionally have **bit-exact** testing — under greedy decoding
    ggml speech tokens equal PyTorch speech tokens token-for-token.
-4. For `chatterbox-tts` we have `--debug` mode that substitutes Python-dumped
+4. For the S3Gen+HiFT back half (`chatterbox_tts.cpp`, driven by `tts-cli`) we have `--debug` mode that substitutes Python-dumped
    random bits for the stochastic parts, pinning the comparison.
 
 Precision regressions are immediately visible: a change that drops rel to
@@ -1403,7 +1403,7 @@ cd ~/chatterbox.cpp
 
 # One-time: build the binaries
 cmake -S . -B build
-cmake --build build -j10 --target chatterbox chatterbox-tts test-s3gen mel2wav
+cmake --build build -j10 --target tts-cli test-s3gen mel2wav
 
 # One-time: convert weights + built-in conditionals
 . ~/chatterbox-ref/.venv/bin/activate
@@ -1457,7 +1457,7 @@ End user workflow:
 
 ```bash
 python scripts/prepare-voice.py --ref-audio me.wav --out voices/me/
-./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
                    --s3gen-gguf models/chatterbox-s3gen.gguf \
                    --ref-dir voices/me/ \
                    --text "Hello in my voice." \
@@ -1523,7 +1523,7 @@ User workflow:
 
 ```bash
 python scripts/prepare-voice.py --ref-audio me.wav --out voices/me/
-./build/chatterbox \
+./build/tts-cli \
     --model models/chatterbox-t3-turbo.gguf \
     --s3gen-gguf models/chatterbox-s3gen.gguf \
     --ref-dir voices/me/ \
@@ -1804,7 +1804,7 @@ field) and the existing T3 `cond_prompt_speech_tokens` override path.
 
 **End-to-end pure-C++ voice cloning**: with `voices/test/` deleted
 entirely and only `--reference-audio my.wav` given, the unified
-`chatterbox` binary now runs the whole flow in C++:
+`tts-cli` now runs the whole flow in C++:
 
 ```
 voice_encoder: computing speaker_emb from /tmp/unified_remote.wav
@@ -2056,7 +2056,7 @@ did 2 Euler steps because that's what Python does. Result: each chunk
 took ~1.5 s to produce 1 s of audio, and the first chunk took ~1.3 s
 before you heard anything.
 
-Two new `chatterbox` CLI flags, no change to the model:
+Two new `tts-cli` flags, no change to the model:
 
 - **`--stream-first-chunk-tokens N`** — the first chunk uses N tokens;
   every chunk after that uses `--stream-chunk-tokens`. So you can make
@@ -2079,7 +2079,7 @@ Two new `chatterbox` CLI flags, no change to the model:
 Recommended low-latency preset:
 
 ```bash
-./build/chatterbox --model t3.gguf --s3gen-gguf s3gen.gguf \
+./build/tts-cli --model t3.gguf --s3gen-gguf s3gen.gguf \
     --text "…" --out out.wav \
     --stream-first-chunk-tokens 10 \
     --stream-chunk-tokens 50 \
@@ -2171,7 +2171,7 @@ are `unlink()`'d right after the bytes hit stdout.  All log output
 stays on stderr so the audio stream is clean.
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
   --model models/chatterbox-t3-turbo.gguf \
   --s3gen-gguf models/chatterbox-s3gen.gguf \
   --text "Testing stdout streaming." \
@@ -2197,7 +2197,7 @@ End-to-end streaming verified audible on an Apple M4 with the Metal
 backend and the recommended low-latency preset:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
     --model models/chatterbox-t3-turbo.gguf \
     --s3gen-gguf models/chatterbox-s3gen.gguf \
     --text "…long paragraph…" \
@@ -2321,7 +2321,7 @@ What to add:
   fallback in `chatterbox_tts.cpp` already reads from exactly those
   tensor names, so there's literally no new load-time code — just the
   converter.
-- **CLI UX:** `chatterbox --reference-audio voice.wav --save-model
+- **CLI UX:** `tts-cli --reference-audio voice.wav --save-model
   alice.gguf --no-synthesize` should be enough to bake once and walk
   away.  No `--text`, no wav output, just the new GGUFs on disk.
 
@@ -2390,10 +2390,9 @@ multi-x real-time with zero extra work.
 
 ---
 
-## ggml extracted into the qvac-ext-ggml vcpkg port (April 2026)
+## ggml extracted into a standalone vcpkg port (April 2026)
 
-Done as part of the `@qvac/tts-ggml` packaging work; mirrors the shape
-[`qvac-ext-stable-diffusion.cpp`][sd-ref] uses with its
+Mirrors the shape `stable-diffusion.cpp` uses with its
 `SD_USE_SYSTEM_GGML` switch.  The standalone Chatterbox dev workflow
 (everything described above) is intentionally untouched.
 
@@ -2402,10 +2401,10 @@ Done as part of the `@qvac/tts-ggml` packaging work; mirrors the shape
 - A single 13/-2-line additive edit to the top of [`CMakeLists.txt`](CMakeLists.txt):
 
   ```cmake
-  option(QVAC_TTS_USE_SYSTEM_GGML "qvac-tts: use system-installed GGML library" OFF)
+  option(TTS_CPP_USE_SYSTEM_GGML "tts-cpp: use system-installed GGML library" OFF)
 
   if (NOT TARGET ggml)
-      if (QVAC_TTS_USE_SYSTEM_GGML)
+      if (TTS_CPP_USE_SYSTEM_GGML)
           find_package(ggml CONFIG REQUIRED)
           if (NOT ggml_FOUND)
               message(FATAL_ERROR "System-installed GGML library not found.")
@@ -2429,44 +2428,38 @@ Done as part of the `@qvac/tts-ggml` packaging work; mirrors the shape
 
 ### What landed elsewhere (out-of-tree, but documented here for context)
 
-- **[`tetherto/qvac-ext-ggml`][qvac-ext-ggml]** gained a `tts` branch
-  off `master` (same commit `stable-diffusion-cpp` builds against)
-  with the same Metal patch we ship under
+- An external `ggml` overlay port was published off ggml `master`
+  (same commit `stable-diffusion-cpp` builds against) with the same
+  Metal patch we ship under
   [`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch)
-  applied as real source commits.  The patch file itself is also
-  retained in `qvac-ext-ggml/patches/` as the source-of-truth artefact
-  for re-application against future ggml syncs.
-- **`tetherto/qvac-registry-vcpkg`** now publishes:
-  - `ggml@2026-01-30#7` — REPO/REF bumped to the `qvac-ext-ggml/tts`
-    head; carries the Metal chatterbox ops.  Backward compatible for
-    `stable-diffusion-cpp` / `whisper-cpp` (additive Metal kernels +
-    opt-in fusion gated by function constants).
-  - `tts-cpp@2026-04-21#1` — REF bumped to the chatterbox.cpp commit
-    that introduces `QVAC_TTS_USE_SYSTEM_GGML`; passes
-    `-DQVAC_TTS_USE_SYSTEM_GGML=ON`; drops every `-DGGML_*` configure
+  applied as real source commits.  The patch file itself is retained
+  alongside the overlay as the source-of-truth artefact for
+  re-application against future ggml syncs.
+- A vcpkg registry now publishes:
+  - `ggml` — REPO/REF bumped to the overlay head carrying the Metal
+    chatterbox ops.  Backward compatible for `stable-diffusion-cpp` /
+    `whisper-cpp` (additive Metal kernels + opt-in fusion gated by
+    function constants).
+  - `tts-cpp` — REF bumped to the chatterbox.cpp commit that
+    introduces `TTS_CPP_USE_SYSTEM_GGML`; passes
+    `-DTTS_CPP_USE_SYSTEM_GGML=ON`; drops every `-DGGML_*` configure
     option, the Android Vulkan-Headers download block, the
     `GGML_VULKAN_DISABLE_COOPMAT*` knobs and the NDK glslc
     detection — all of those now live inside the `ggml` port.
-    Declares an explicit `ggml >= 2026-01-30#7` dependency with
-    `metal`/`vulkan` feature forwarding (mirrors
-    [`stable-diffusion-cpp/vcpkg.json`][sd-port-json]).
+    Declares an explicit `ggml` dependency with `metal`/`vulkan`
+    feature forwarding (mirrors `stable-diffusion-cpp/vcpkg.json`).
 
 ### Validation
 
 - **chatterbox.cpp standalone** (Apple M4, Metal): clean configure +
-  build of every target with default `-DQVAC_TTS_USE_SYSTEM_GGML=OFF`;
+  build of every target with default `-DTTS_CPP_USE_SYSTEM_GGML=OFF`;
   `test-metal-ops` parity-checks all four patched ops
   (`diag_mask_inf`, `pad_ext` with `lp0..lp3`,
   `conv_transpose_1d` at the three chatterbox upsample stages and the
   tiny edge case); CLI smoke synth produces an 86 KB WAV in 3.2 s
   (T3 642 ms / S3Gen 635 ms / 1.84 s audio, RTF 0.34).
-- **`@qvac/tts-ggml`** (darwin-arm64, Metal): cold-cache
-  `bare-make generate` resolves both new ports, `bare-make build`
-  links the addon against `ggml::ggml` with no further changes;
-  unit suite 38/38, integration 4/4 (Whisper round-trip 0.0% WER on
-  *"How are you doing today?"*, native chunk streaming emits 8
-  chunks, sentence streaming RTF 0.5448).
-
-[sd-ref]: https://github.com/tetherto/qvac-ext-stable-diffusion.cpp
-[sd-port-json]: https://github.com/tetherto/qvac-registry-vcpkg/blob/main/ports/stable-diffusion-cpp/vcpkg.json
-[qvac-ext-ggml]: https://github.com/tetherto/qvac-ext-ggml
+- **Downstream addon** (darwin-arm64, Metal): cold-cache vcpkg resolve
+  picks up both new ports, the addon links against `ggml::ggml` with
+  no further changes; unit suite 38/38, integration 4/4 (Whisper
+  round-trip 0.0% WER on *"How are you doing today?"*, native chunk
+  streaming emits 8 chunks, sentence streaming RTF 0.5448).

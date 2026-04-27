@@ -4,6 +4,7 @@ ggml/
 # Build artifacts
 build/
 build-*/
+build_tts_cli/
 *.o
 *.obj
 

@@ -65,7 +65,7 @@ extraction via STFT matmul, legacy Q4/Q5/Q8 quantization, etc.).
        │                                                        ▲
        ▼                                                        │
   ┌────────────────────────────────────────────────────────────────┐
-  │                       chatterbox                               │
+  │                        tts-cli                                 │
   │                                                                │
   │   T3 (GPT-2 Medium)  ──►  S3Gen encoder  ──►  CFM (meanflow)   │
   │   text → speech toks      speech toks → h      h → mel         │
@@ -108,9 +108,8 @@ cd -
 git clone git@github.com:gianni-cor/chatterbox.cpp.git
 cd chatterbox.cpp
 
-# Clone ggml at the pinned commit and apply our Metal op patches.
-# Skip the patch part (i.e. just `git clone ... ggml`) if you're not
-# building with -DGGML_METAL=ON.
+# Clone ggml at the pinned commit and apply the Metal + OpenCL patches
+# (see patches/).  Re-running resets ./ggml to the pin and reapplies.
 ./scripts/setup-ggml.sh
 
 # Configure + build every target in one shot.
@@ -118,25 +117,29 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
 
-`scripts/setup-ggml.sh` is idempotent: it clones upstream
-[`ggml`](https://github.com/ggml-org/ggml) into `./ggml`, checks out the
-commit our patch is pinned against (`GGML_COMMIT` at the top of the
-script), and applies
-[`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch).
-Re-running it is a no-op; bump the pinned commit inside the script
-whenever the patch is re-generated against a newer upstream.
+`scripts/setup-ggml.sh` clones upstream
+[`ggml`](https://github.com/ggml-org/ggml) into `./ggml`, hard-resets to the
+commit pinned in `GGML_COMMIT`, and applies
+[`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch)
+then
+[`patches/ggml-opencl-chatterbox-ops.patch`](patches/ggml-opencl-chatterbox-ops.patch).
+Re-running is safe: any local edits under `./ggml` are discarded.  Bump
+`GGML_COMMIT` and regenerate the patches when moving to a newer upstream
+ggml.
 
 To enable GPU acceleration, add the matching backend flag at configure
 time: `-DGGML_METAL=ON` on Apple Silicon, `-DGGML_VULKAN=ON` on
-Linux/Windows with a Vulkan loader, or `-DGGML_CUDA=ON` if you have the
-CUDA toolkit. Pass `--n-gpu-layers 99` at runtime to actually use the
-GPU. See `patches/README.md` for what the Metal patch does and why.
+Linux/Windows with a Vulkan loader, `-DGGML_OPENCL=ON` for OpenCL
+(Android/Termux, etc., after applying the OpenCL patch above), or
+`-DGGML_CUDA=ON` if you have the CUDA toolkit. Pass `--n-gpu-layers 99` at
+runtime to actually use the GPU. See `patches/README.md` for what the
+patches do and why.
 
 This produces the main binary plus a set of per-stage validation harnesses:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/chatterbox`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Also handles voice cloning via `--reference-audio`. |
+| `build/tts-cli`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Also handles voice cloning via `--reference-audio`. |
 | `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
 | `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
 | `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler |
@@ -148,36 +151,32 @@ This produces the main binary plus a set of per-stage validation harnesses:
 | `build/test-s3tokenizer`      | S3TokenizerV2 log-mel + speech-token parity |
 | `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
 
-You'll normally only need `build/chatterbox`; the `test-*` binaries are
+You'll normally only need `build/tts-cli`; the `test-*` binaries are
 there for the staged-verification methodology in `PROGRESS.md`.
 
-### Alternative: consume ggml from vcpkg (`QVAC_TTS_USE_SYSTEM_GGML`)
+### Alternative: consume ggml from vcpkg (`TTS_CPP_USE_SYSTEM_GGML`)
 
-Downstream projects that already vendor ggml through vcpkg (e.g. the
-`@qvac/tts-ggml` Bare addon) can skip `setup-ggml.sh` and instead point
-the build at a pre-installed ggml package:
+Downstream projects that already vendor ggml through vcpkg can skip
+`setup-ggml.sh` and instead point the build at a pre-installed ggml
+package:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DQVAC_TTS_USE_SYSTEM_GGML=ON
+  -DTTS_CPP_USE_SYSTEM_GGML=ON
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
 
-When `QVAC_TTS_USE_SYSTEM_GGML=ON`, the top-level `CMakeLists.txt`
+When `TTS_CPP_USE_SYSTEM_GGML=ON`, the top-level `CMakeLists.txt`
 swaps `add_subdirectory(ggml)` for `find_package(ggml CONFIG REQUIRED)`
 and aliases the imported `ggml::ggml` target onto the plain `ggml` name
 that the rest of the build uses.  The local `./ggml/` tree is never
-read.  The expected source of truth for the imported package is the
-`ggml` overlay port published from
-[`tetherto/qvac-ext-ggml`][qvac-ext-ggml] (currently a `tts` branch
-that carries the same Metal patch found under `patches/`).  This shape
-mirrors `qvac-ext-stable-diffusion.cpp`'s `SD_USE_SYSTEM_GGML`.
+read.  The imported package is expected to provide the same Metal
+patch carried under `patches/`.  This shape mirrors
+`stable-diffusion.cpp`'s `SD_USE_SYSTEM_GGML`.
 
-The default (`QVAC_TTS_USE_SYSTEM_GGML=OFF`) preserves the standalone
+The default (`TTS_CPP_USE_SYSTEM_GGML=OFF`) preserves the standalone
 flow above untouched, so this is purely an opt-in escape hatch for
 package-manager-driven builds.
-
-[qvac-ext-ggml]: https://github.com/tetherto/qvac-ext-ggml
 
 ## 2. One-time: convert weights
 
@@ -278,7 +277,7 @@ Swap `q8_0` → `q4_0` (or `q5_0`) for a more aggressive variant.  T3's
 original converter also accepts `--quant` if you prefer to quantize at
 conversion time instead of after.
 
-Measured on the QVAC paragraph (M3 Ultra, Metal, streaming mode
+Measured on a representative paragraph (M3 Ultra, Metal, streaming mode
 `--stream-chunk-tokens 25 --max-sentence-chars 100`):
 
 | T3 / S3Gen                | total size | first-audio | total wall | cos sim¹ |
@@ -312,10 +311,10 @@ source dtype to keep numerics clean.  That's why Q4_0 ends up only
 ~15 % smaller than Q8_0 rather than 2× smaller; the bulk not covered
 by block quantization dominates.
 
-Pass the quantized GGUFs to `chatterbox` exactly like the defaults:
+Pass the quantized GGUFs to `tts-cli` exactly like the defaults:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
   --model      models/t3-q8_0.gguf \
   --s3gen-gguf models/chatterbox-s3gen-q8_0.gguf \
   --text "Hello from the quantized port." \
@@ -333,7 +332,7 @@ The easiest way:
 That's equivalent to running the binary directly:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
   --model       models/chatterbox-t3-turbo.gguf \
   --s3gen-gguf  models/chatterbox-s3gen.gguf \
   --text        "Hello from native C plus plus." \
@@ -346,7 +345,7 @@ CFG / perceiver / 10-step-CFM machinery automatically based on the GGUF's
 `chatterbox.variant` metadata:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
   --model       models/chatterbox-t3-mtl.gguf \
   --s3gen-gguf  models/chatterbox-s3gen-mtl.gguf \
   --text        "Hola, esto es una demostración multilingüe." \
@@ -377,7 +376,7 @@ Advanced modes:
   (no Python, no preprocessing step):
 
   ```bash
-  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
                      --reference-audio me.wav \
                      --text "Hello in my voice." \
@@ -434,7 +433,7 @@ Advanced modes:
 
   ```bash
   # Bake the profile (no --text needed; just preprocesses + saves).
-  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
                      --reference-audio me.wav \
                      --save-voice voices/me/
@@ -443,7 +442,7 @@ Advanced modes:
 
   # Reuse (≈ 17× faster; VoiceEncoder / CAMPPlus / S3TokenizerV2
   # / mel extraction are all skipped).
-  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
                      --ref-dir voices/me/ \
                      --text "Anything you want." \
@@ -472,9 +471,9 @@ sentence terminators (or `\n` in `--input-by-line` mode), and pipes
 raw PCM (s16le, 24 kHz, mono) to stdout chunk-by-chunk.
 
 ```bash
-# Two-process demo: background writer appends sentences, chatterbox
+# Two-process demo: background writer appends sentences, tts-cli
 # tail-follows, sox plays in real time.
-./build/chatterbox \
+./build/tts-cli \
     --model       models/t3-q8_0.gguf \
     --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
     --ref-dir     voices/alice \
@@ -495,7 +494,7 @@ stdin.  On a terminal you get a `> ` prompt; each Enter-terminated
 line is spoken immediately, Ctrl-D exits:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
     --model       models/t3-q8_0.gguf \
     --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
     --ref-dir     voices/alice \
@@ -655,7 +654,7 @@ Spanish sentence in the JFK-cloned voice.
 
 ```bash
 # Build chatterbox.cpp, then:
-./build/chatterbox \
+./build/tts-cli \
     --model       models/chatterbox-t3-turbo.gguf \
     --s3gen-gguf  models/chatterbox-s3gen.gguf \
     --reference-audio test/reference-audio/jfk.wav \
@@ -707,7 +706,7 @@ Any non-zero `--stream-chunk-tokens N` turns streaming on.
 ```bash
 brew install sox      # one-time, for the `play` command
 
-./build/chatterbox \
+./build/tts-cli \
     --model      models/chatterbox-t3-turbo.gguf \
     --s3gen-gguf models/chatterbox-s3gen.gguf \
     --text       "Hello from streaming Chatterbox." \
@@ -729,7 +728,7 @@ default.
 You can also drop the `--out -` to get a regular wav:
 
 ```bash
-./build/chatterbox … --stream-chunk-tokens 50 --out out.wav
+./build/tts-cli … --stream-chunk-tokens 50 --out out.wav
 afplay out.wav
 ```
 
@@ -793,7 +792,7 @@ For T3 bit-exact validation against the Python reference:
 python scripts/reference-t3-turbo.py \
   --text "Hello from ggml." \
   --out-dir artifacts \
-  --cpp-bin ./build/chatterbox \
+  --cpp-bin ./build/tts-cli \
   --cpp-model models/chatterbox-t3-turbo.gguf
 ```
 
@@ -803,10 +802,11 @@ python scripts/reference-t3-turbo.py \
 chatterbox.cpp/
   ggml/                          pristine ggml clone (not tracked; populated
                                    by scripts/setup-ggml.sh, or skipped entirely
-                                   when building with -DQVAC_TTS_USE_SYSTEM_GGML=ON)
+                                   when building with -DTTS_CPP_USE_SYSTEM_GGML=ON)
   src/
-    main.cpp                     CLI + T3 runtime            (chatterbox)
-    chatterbox_tts.cpp           S3Gen + HiFT pipeline       (linked into chatterbox)
+    main.cpp                     T3 runtime + shared helpers  (libtts-cpp)
+    chatterbox_cli.cpp           CLI entry (`tts-cli` binary)
+    chatterbox_tts.cpp           S3Gen + HiFT pipeline        (libtts-cpp)
     s3gen_pipeline.h             public API for the S3Gen+HiFT back half
     mel2wav.cpp                  HiFT-only demo              (mel2wav)
     gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer
@@ -836,7 +836,8 @@ chatterbox.cpp/
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
   patches/
-    ggml-metal-chatterbox-ops.patch  ggml-metal fixes (see patches/README.md)
+    ggml-metal-chatterbox-ops.patch   ggml-metal fixes
+    ggml-opencl-chatterbox-ops.patch  OpenCL: HiFT (CONV_TRANSPOSE_1D, SIN, …)
     README.md                    applies-to / what-it-does notes
   voices/                        baked voice profiles (not tracked; populated
                                    by --save-voice)

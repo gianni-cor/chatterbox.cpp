@@ -8,6 +8,8 @@
 #include "chatterbox_t3_internal.h"
 #include "ggml.h"
 
+namespace tts_cpp::chatterbox::detail {
+
 // Each builder returns a ggml_cgraph*; the caller uses ggml_gallocr_reserve +
 // alloc_graph and sets input tensors by name before compute.
 
@@ -47,3 +49,5 @@ ggml_cgraph * build_stage_layers_graph(const chatterbox_model & m, int N,
 //   Inputs : "inputs_embeds"  F32 (n_embd, N)  [post-layer hidden state]
 //   Output : "logits"         F32 (n_speech_vocab, 1)  [last position]
 ggml_cgraph * build_stage_head_graph(const chatterbox_model & m, int N);
+
+} // namespace tts_cpp::chatterbox::detail

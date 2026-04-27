@@ -25,7 +25,7 @@ TEST_CASES = [
 
 
 def c_tokenize(binary: Path, gguf_model: Path, text: str) -> list[int]:
-    """Call the chatterbox binary with --dump-tokens-only to get C++ tokens.
+    """Call the tts-cli binary with --dump-tokens-only to get C++ tokens.
     The GGUF must embed the tokenizer (standard tokenizer.ggml.* metadata)."""
     result = subprocess.run(
         [str(binary), "--model", str(gguf_model),
@@ -44,7 +44,7 @@ def c_tokenize(binary: Path, gguf_model: Path, text: str) -> list[int]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", type=Path, required=True,
-                    help="Path to the chatterbox binary")
+                    help="Path to the tts-cli binary")
     ap.add_argument("--model", type=Path, required=True,
                     help="Path to chatterbox-t3-turbo.gguf (contains embedded tokenizer)")
     ap.add_argument("--tokenizer-dir", type=Path, required=True,

@@ -20,6 +20,8 @@
 #include <thread>
 #include <vector>
 
+using namespace tts_cpp::chatterbox::detail;
+
 int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr,

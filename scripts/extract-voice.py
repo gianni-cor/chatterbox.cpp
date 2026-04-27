@@ -14,7 +14,7 @@ Workflow:
                                                      (highpass + denoise + EQ +
                                                       loudnorm + alimiter)
   5. Run ffmpeg, writing `voices/<name>.wav`.
-  6. Optionally bake the voice profile via `./build/chatterbox --save-voice`.
+  6. Optionally bake the voice profile via `./build/tts-cli --save-voice`.
 
 Typical use:
     ./scripts/extract-voice.py ~/Downloads/marco.ogg
@@ -22,7 +22,7 @@ Typical use:
     ./scripts/extract-voice.py ~/Downloads/marco.ogg --name marco --target 8
 
 Requires: ffmpeg / ffprobe on PATH, Python 3.8+, and (if --bake) a built
-./build/chatterbox plus models/t3-q8_0.gguf + models/chatterbox-s3gen-q8_0.gguf.
+./build/tts-cli plus models/t3-q8_0.gguf + models/chatterbox-s3gen-q8_0.gguf.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Chatterbox requirements.
 # ---------------------------------------------------------------------------
-MIN_REF_SECONDS = 5.1      # chatterbox errors under 5.0 s; leave a safety margin
+MIN_REF_SECONDS = 5.1      # tts-cli errors under 5.0 s; leave a safety margin
 MAX_REF_SECONDS = 15.0     # longer than this dilutes the speaker embedding
 DEFAULT_TARGET  = 10.0     # sweet spot between prosody variety and focused timbre
 SAMPLE_RATE     = 24000
@@ -490,19 +490,19 @@ def extract(info: SourceInfo, plan: WindowPlan, out_wav: Path,
 
 
 # ---------------------------------------------------------------------------
-# Optional: bake the voice profile via ./build/chatterbox.
+# Optional: bake the voice profile via ./build/tts-cli.
 # ---------------------------------------------------------------------------
-def bake(chatterbox: Path, t3: Path, s3gen: Path,
+def bake(tts_cli: Path, t3: Path, s3gen: Path,
          ref_wav: Path, out_dir: Path,
          n_gpu_layers: int, verbose: bool) -> None:
-    for p, what in [(chatterbox, "chatterbox binary"),
+    for p, what in [(tts_cli, "tts-cli binary"),
                     (t3, "T3 model"),
                     (s3gen, "S3Gen model")]:
         if not p.exists():
             sys.exit(f"error: --bake requires {what} at {p}")
 
     cmd = [
-        str(chatterbox),
+        str(tts_cli),
         "--model",            str(t3),
         "--s3gen-gguf",       str(s3gen),
         "--reference-audio",  str(ref_wav),
@@ -537,10 +537,11 @@ def main() -> None:
                     help="Override auto filter-chain pick.  'noisered' requires SoX on "
                          "PATH and at least 0.3 s of silence at the start of the source.")
     ap.add_argument("--bake", action="store_true",
-                    help="After extracting, call ./build/chatterbox --save-voice to "
+                    help="After extracting, call ./build/tts-cli --save-voice to "
                          "pre-compute the 5 conditioning tensors (faster future runs).")
-    ap.add_argument("--chatterbox", type=Path, default=Path("./build/chatterbox"),
-                    help="Path to chatterbox binary (default: ./build/chatterbox)")
+    ap.add_argument("--tts-cli", type=Path, default=Path("./build/tts-cli"),
+                    dest="tts_cli",
+                    help="Path to tts-cli binary (default: ./build/tts-cli)")
     ap.add_argument("--t3", type=Path, default=Path("models/t3-q8_0.gguf"),
                     help="Path to T3 GGUF (default: models/t3-q8_0.gguf)")
     ap.add_argument("--s3gen", type=Path, default=Path("models/chatterbox-s3gen-q8_0.gguf"),
@@ -589,13 +590,13 @@ def main() -> None:
 
     if args.bake:
         profile_dir = args.out_dir / name
-        bake(args.chatterbox, args.t3, args.s3gen, ref_wav, profile_dir,
+        bake(args.tts_cli, args.t3, args.s3gen, ref_wav, profile_dir,
              args.n_gpu_layers, args.verbose)
         print(f"baked:   {profile_dir}")
         print(f"\nReuse with:  --ref-dir {profile_dir}")
     else:
         print(f"\nBake profile with:")
-        print(f"  {args.chatterbox} \\")
+        print(f"  {args.tts_cli} \\")
         print(f"    --model {args.t3} \\")
         print(f"    --s3gen-gguf {args.s3gen} \\")
         print(f"    --reference-audio {ref_wav} \\")

@@ -27,6 +27,8 @@
 #include <thread>
 #include <vector>
 
+using namespace tts_cpp::chatterbox::detail;
+
 namespace {
 
 struct stage_run {
