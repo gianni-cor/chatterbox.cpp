@@ -650,6 +650,67 @@ index 6f3fc588..5725454a 100644
          case GGML_OP_SSM_CONV:
              if (!any_on_device) {
                  return false;
+diff --git a/src/ggml-opencl/kernels/abs.cl b/src/ggml-opencl/kernels/abs.cl
+new file mode 100644
+index 00000000..5b38fd57
+--- /dev/null
++++ b/src/ggml-opencl/kernels/abs.cl
+@@ -0,0 +1,55 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++kernel void kernel_abs_f32(
++        global const float * src0,
++        ulong                offset0,
++        global       float * dst,
++        ulong                offsetd
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    dst  = (global float*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = fabs(src0[get_global_id(0)]);
++}
++
++kernel void kernel_abs_f32_4(
++        global const float4 * src0,
++        ulong                 offset0,
++        global       float4 * dst,
++        ulong                 offsetd
++) {
++    src0 = (global float4*)((global char*)src0 + offset0);
++    dst  = (global float4*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = fabs(src0[get_global_id(0)]);
++}
++
++kernel void kernel_abs_f32_nc(
++        global const char * src0,
++        ulong               offset0,
++        global       char * dst,
++        ulong               offsetd,
++        int   ne00,
++        ulong nb00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        ulong nb0,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src0 = src0 + offset0;
++    dst  = dst + offsetd;
++
++    const int i3 = get_group_id(2);
++    const int i2 = get_group_id(1);
++    const int i1 = get_group_id(0);
++
++    for (int i0 = get_local_id(0); i0 < ne00; i0 += get_local_size(0)) {
++        global const float * x = (global const float *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
++        global       float * y = (global       float *)(dst  + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
++
++        *y = fabs(*x);
++    }
++}
 diff --git a/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl b/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl
 new file mode 100644
 index 00000000..376871f6
@@ -760,6 +821,75 @@ index 00000000..cba207cb
 +    }
 +
 +    dD[CTD_IDX(ox, i1, ib, d_nb0, d_nb1, d_nb2)] = acc;
++}
+diff --git a/src/ggml-opencl/kernels/elu.cl b/src/ggml-opencl/kernels/elu.cl
+new file mode 100644
+index 00000000..af113dc8
+--- /dev/null
++++ b/src/ggml-opencl/kernels/elu.cl
+@@ -0,0 +1,63 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++static inline float elu_f32(float x) {
++    return fmax(x, 0.0f) + fmin(expm1(x), 0.0f);
++}
++
++static inline float4 elu_f32_4(float4 x) {
++    return fmax(x, (float4)(0.0f)) + fmin(expm1(x), (float4)(0.0f));
++}
++
++kernel void kernel_elu_f32(
++        global const float * src0,
++        ulong                offset0,
++        global       float * dst,
++        ulong                offsetd
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    dst  = (global float*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = elu_f32(src0[get_global_id(0)]);
++}
++
++kernel void kernel_elu_f32_4(
++        global const float4 * src0,
++        ulong                 offset0,
++        global       float4 * dst,
++        ulong                 offsetd
++) {
++    src0 = (global float4*)((global char*)src0 + offset0);
++    dst  = (global float4*)((global char*)dst + offsetd);
++
++    dst[get_global_id(0)] = elu_f32_4(src0[get_global_id(0)]);
++}
++
++kernel void kernel_elu_f32_nc(
++        global const char * src0,
++        ulong               offset0,
++        global       char * dst,
++        ulong               offsetd,
++        int   ne00,
++        ulong nb00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        ulong nb0,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src0 = src0 + offset0;
++    dst  = dst + offsetd;
++
++    const int i3 = get_group_id(2);
++    const int i2 = get_group_id(1);
++    const int i1 = get_group_id(0);
++
++    for (int i0 = get_local_id(0); i0 < ne00; i0 += get_local_size(0)) {
++        global const float * x = (global const float *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
++        global       float * y = (global       float *)(dst  + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
++
++        *y = elu_f32(*x);
++    }
 +}
 diff --git a/src/ggml-opencl/kernels/relu.cl b/src/ggml-opencl/kernels/relu.cl
 index 60ff28a6..249f5e99 100644
