@@ -183,7 +183,7 @@ def add_tensor_maybe_q(
     if arr.dtype.kind in "iu" or np.issubdtype(arr.dtype, np.integer):
         writer.add_tensor(name, arr)
         return
-    if quant == "f16":
+    if quant in ("f16", "f32"):
         writer.add_tensor(name, arr)
         return
 
@@ -273,7 +273,7 @@ def main():
     writer.add_uint32("s3gen.n_timesteps", cfg["n_timesteps"])
     writer.add_float32("s3gen.cfg_rate", cfg["cfg_rate"])
 
-    qstats: Optional[dict[str, int]] = {"n_quant": 0} if args.quant != "f16" else None
+    qstats: Optional[dict[str, int]] = {"n_quant": 0} if args.quant not in ("f16", "f32") else None
 
     # Meta / hparams
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
@@ -556,7 +556,7 @@ def main():
 
     out_size_mb = args.out.stat().st_size / (1024 * 1024)
     print(f"\nOutput: {args.out} ({out_size_mb:.0f} MB)")
-    if args.quant != "f16" and qstats is not None:
+    if args.quant not in ("f16", "f32") and qstats is not None:
         print(f"  --quant {args.quant}: {qstats['n_quant']} tensors block-quantized "
               f"(policy matches scripts/requantize-gguf.py; embeddings, voice encoders, "
               f"norms/biases, and filterbanks kept at full precision)")
