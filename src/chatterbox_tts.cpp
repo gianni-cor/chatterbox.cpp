@@ -248,6 +248,12 @@ static ggml_tensor * find_tensor(const model_ctx & m, const std::string & name) 
 // F32 conv1d via im2col + mul_mat.  kernel ne=[K, IC, OC]
 static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
                                 int stride, int padding, int dilation) {
+    if (std::getenv("CHATTERBOX_DIRECT_CONV1D")) {
+        ggml_tensor * k4 = ggml_reshape_4d(ctx, kernel, kernel->ne[0], 1, kernel->ne[1], kernel->ne[2]);
+        ggml_tensor * x4 = ggml_reshape_4d(ctx, input, input->ne[0], 1, input->ne[1], input->ne[2] * input->ne[3]);
+        ggml_tensor * y4 = ggml_conv_2d_direct(ctx, k4, x4, stride, 1, padding, 0, dilation, 1);
+        return ggml_reshape_3d(ctx, y4, y4->ne[0], y4->ne[2], y4->ne[3]);
+    }
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
     ggml_tensor * result = ggml_mul_mat(ctx,
         ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
