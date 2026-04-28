@@ -38,7 +38,7 @@ index 540942b1..d9f93004 100644
      flash_attn_f16
      flash_attn_f32
 diff --git a/src/ggml-opencl/ggml-opencl.cpp b/src/ggml-opencl/ggml-opencl.cpp
-index 6f3fc588..60b6ea30 100644
+index 6f3fc588..9b351c6d 100644
 --- a/src/ggml-opencl/ggml-opencl.cpp
 +++ b/src/ggml-opencl/ggml-opencl.cpp
 @@ -28,6 +28,7 @@
@@ -303,7 +303,7 @@ index 6f3fc588..60b6ea30 100644
      // ssm_conv
      {
  #ifdef GGML_OPENCL_EMBED_KERNELS
-@@ -3716,6 +3865,88 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
+@@ -3716,6 +3865,89 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
          if (!ggml_is_contiguous(gn->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
              return false;
          }
@@ -378,7 +378,8 @@ index 6f3fc588..60b6ea30 100644
 +        if (mul->src[1]->ne[1] != 1 || mul->src[1]->ne[2] != 1 || mul->src[1]->ne[3] != 1) {
 +            return false;
 +        }
-+        if (bias->type != GGML_TYPE_F32 || !ggml_are_same_shape(bias, mul) || !ggml_is_contiguous(bias)) {
++        const bool bias_is_row = ggml_nelements(bias) == bias->ne[0] && bias->ne[0] == mul->ne[0];
++        if (bias->type != GGML_TYPE_F32 || !(bias_is_row || ggml_are_same_shape(bias, mul)) || !ggml_is_contiguous(bias)) {
 +            return false;
 +        }
 +        if (ops.size() == 3) {
@@ -392,7 +393,7 @@ index 6f3fc588..60b6ea30 100644
      }
  
      return true;
-@@ -3724,6 +3955,9 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
+@@ -3724,6 +3956,9 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
  static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
  static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
  static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
@@ -402,7 +403,7 @@ index 6f3fc588..60b6ea30 100644
  
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
-@@ -3759,6 +3993,26 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -3759,6 +3994,26 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
              i++;
              continue;
          }
@@ -429,7 +430,7 @@ index 6f3fc588..60b6ea30 100644
  
          bool ok = ggml_cl_compute_forward(backend, node);
          if (!ok) {
-@@ -3767,6 +4021,19 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -3767,6 +4022,19 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
          GGML_ASSERT(ok);
      }
  
@@ -449,7 +450,7 @@ index 6f3fc588..60b6ea30 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -3865,8 +4132,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -3865,8 +4133,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
          case GGML_OP_SQRT:
              return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                      ggml_is_contiguous(op->src[0]);
@@ -465,7 +466,7 @@ index 6f3fc588..60b6ea30 100644
                  case GGML_UNARY_OP_GELU:
                  case GGML_UNARY_OP_SILU:
                  case GGML_UNARY_OP_RELU:
-@@ -3902,6 +4176,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -3902,6 +4177,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
          case GGML_OP_FILL:
              return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
@@ -475,7 +476,7 @@ index 6f3fc588..60b6ea30 100644
          case GGML_OP_CLAMP:
              return op->src[0]->type == GGML_TYPE_F32;
          case GGML_OP_SOFT_MAX:
-@@ -3929,6 +4206,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -3929,6 +4207,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
                     (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
                     (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
@@ -496,7 +497,7 @@ index 6f3fc588..60b6ea30 100644
          case GGML_OP_SSM_CONV:
              return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
          case GGML_OP_CONCAT:
-@@ -4075,8 +4366,15 @@ static ggml_backend_i ggml_backend_opencl_i = {
+@@ -4075,8 +4367,15 @@ static ggml_backend_i ggml_backend_opencl_i = {
  };
  
  ggml_backend_t ggml_backend_opencl_init(void) {
@@ -513,7 +514,7 @@ index 6f3fc588..60b6ea30 100644
  
      ggml_backend_t backend = new ggml_backend {
          /* .guid    = */ ggml_backend_opencl_guid(),
-@@ -5987,8 +6285,8 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t
+@@ -5987,8 +6286,8 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t
  
  static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
      /* .get_name         = */ ggml_backend_opencl_reg_get_name,
@@ -524,7 +525,7 @@ index 6f3fc588..60b6ea30 100644
      /* .get_proc_address = */ NULL,
  };
  
-@@ -6631,6 +6929,90 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -6631,6 +6930,90 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
      }
  }
  
@@ -615,7 +616,7 @@ index 6f3fc588..60b6ea30 100644
  static void ggml_cl_add_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -7495,6 +7877,44 @@ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -7495,6 +7878,44 @@ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
  }
  
@@ -660,7 +661,7 @@ index 6f3fc588..60b6ea30 100644
  static void ggml_cl_sigmoid(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -8225,6 +8645,295 @@ static void ggml_cl_tanh(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -8225,6 +8646,295 @@ static void ggml_cl_tanh(ggml_backend_t backend, const ggml_tensor * src0, const
      }
  }
  
@@ -956,7 +957,7 @@ index 6f3fc588..60b6ea30 100644
  static void ggml_cl_neg(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -9247,6 +9956,83 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -9247,6 +9957,83 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
      backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
  }
  
@@ -1040,7 +1041,7 @@ index 6f3fc588..60b6ea30 100644
  static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
-@@ -10190,7 +10976,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
+@@ -10190,7 +10977,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
  #endif
  }
  
@@ -1050,7 +1051,7 @@ index 6f3fc588..60b6ea30 100644
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
      GGML_ASSERT(src1);
-@@ -10206,10 +10993,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -10206,10 +10994,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
      ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
      ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
      ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
@@ -1065,7 +1066,7 @@ index 6f3fc588..60b6ea30 100644
  
  #ifdef GGML_OPENCL_SOA_Q
      ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)src0->extra;
-@@ -10527,6 +11318,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -10527,6 +11319,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
              CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &ne1));
              CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &r2));
              CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &r3));
@@ -1082,7 +1083,24 @@ index 6f3fc588..60b6ea30 100644
          } else {
              region.origin = extrad->offset; // Specify the starting offset (in bytes)
              region.size = M * N * sizeof(float); // Specify the size of the sub-buffer
-@@ -11622,6 +12423,23 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -10675,6 +11477,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
+                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
++                cl_mem bias_mem = extrabias ? extrabias->data_device : extra1->data_device;
++                cl_mem residual_mem = extraresidual ? extraresidual->data_device : extra1->data_device;
++                const int has_bias = bias != nullptr;
++                const int has_residual = residual != nullptr;
++                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &bias_mem));
++                CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &offsetbias));
++                CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_mem),   &residual_mem));
++                CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &offsetresidual));
++                CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &has_bias));
++                CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &has_residual));
+ 
+                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
+                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+@@ -11622,6 +12434,23 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
      }
  }
  
@@ -1106,7 +1124,7 @@ index 6f3fc588..60b6ea30 100644
  static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -13235,6 +14053,24 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -13235,6 +14064,24 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_sqrt;
              break;
@@ -1131,7 +1149,7 @@ index 6f3fc588..60b6ea30 100644
          case GGML_OP_MEAN:
              if (!any_on_device) {
                  return false;
-@@ -13243,6 +14079,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -13243,6 +14090,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              break;
          case GGML_OP_UNARY:
              switch (ggml_get_unary_op(tensor)) {
@@ -1150,7 +1168,7 @@ index 6f3fc588..60b6ea30 100644
                  case GGML_UNARY_OP_GELU:
                      if (!any_on_device) {
                          return false;
-@@ -13384,6 +14232,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -13384,6 +14243,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_conv_2d;
              break;
@@ -1676,6 +1694,48 @@ index 00000000..a1ebf57f
 +
 +    dst[get_global_id(0)] = mish_f32_4(src0[get_global_id(0)]);
 +}
+diff --git a/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl b/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
+index 4100e308..394fc1e0 100644
+--- a/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
++++ b/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
+@@ -32,7 +32,13 @@ kernel void kernel_mul_mm_q4_0_f32_l4_lm(
+     int batch_stride_d,
+ 
+     int r2,
+-    int r3
++    int r3,
++    global float * bias,
++    ulong offset_bias,
++    global float * residual,
++    ulong offset_residual,
++    int has_bias,
++    int has_residual
+ ) {
+     src1 = (global float4*)((global char*)src1 + offset1);
+     dst  = (global float *)((global char*)dst  + offsetd);
+@@ -152,11 +158,21 @@ kernel void kernel_mul_mm_q4_0_f32_l4_lm(
+     const int dc = ic * BN + th_c * TN;
+ 
+     const int offsets = batch_idx * batch_stride_d;
++    bias = (global float*)((global char*)bias + offset_bias);
++    residual = (global float*)((global char*)residual + offset_residual);
+ 
+     for (int cc = 0; cc < TN; cc++) {
+         for (int cr = 0; cr < TM; cr++) {
+             if (dr + cr < ne01 && dc + cc < ne11) {
+-                dst[offsets + (dc + cc) * stride_d + dr + cr] = sums[cc * TM + cr];
++                const int idx = offsets + (dc + cc) * stride_d + dr + cr;
++                float v = sums[cc * TM + cr];
++                if (has_bias) {
++                    v += bias[dr + cr];
++                }
++                if (has_residual) {
++                    v += residual[idx];
++                }
++                dst[idx] = v;
+             }
+         }
+     }
 diff --git a/src/ggml-opencl/kernels/relu.cl b/src/ggml-opencl/kernels/relu.cl
 index 60ff28a6..249f5e99 100644
 --- a/src/ggml-opencl/kernels/relu.cl
