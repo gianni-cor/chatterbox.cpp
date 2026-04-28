@@ -631,7 +631,7 @@ static basic_tfm_w load_basic_tfm(const model_ctx & m, const std::string & pfx) 
 }
 
 static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
-                               ggml_tensor * x, int T, int C, bool f16_kv_attn, int H = 8, int HD = 64) {
+                               ggml_tensor * x, int T, int C, bool f16_kv_attn, bool f16_qkv_attn, int H = 8, int HD = 64) {
     int INNER = H * HD;
     ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
@@ -641,7 +641,14 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
     q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, HD, H, T), 0, 2, 1, 3));
     k = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, HD, H, T), 0, 2, 1, 3));
     v = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v, HD, H, T), 0, 2, 1, 3));
-    if (f16_kv_attn) {
+    if (f16_qkv_attn) {
+        ggml_tensor * q_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
+        ggml_tensor * k_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
+        ggml_tensor * v_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
+        q = ggml_cpy(ctx, q, q_f16);
+        k = ggml_cpy(ctx, k, k_f16);
+        v = ggml_cpy(ctx, v, v_f16);
+    } else if (f16_kv_attn) {
         ggml_tensor * k_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
         ggml_tensor * v_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
         k = ggml_cpy(ctx, k, k_f16);
@@ -654,6 +661,10 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
                                                 /*scale=*/1.0f / std::sqrt((float)HD),
                                                 /*max_bias=*/0.0f,
                                                 /*logit_softcap=*/0.0f);
+    if (f16_qkv_attn) {
+        ggml_tensor * attn_f32 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, H, T);
+        attn_fa = ggml_cpy(ctx, attn_fa, attn_f32);
+    }
     // flash_attn_ext output: ne=[HD, H, T, 1] (contiguous). Reshape to (INNER, T).
     ggml_tensor * flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
@@ -674,9 +685,9 @@ static cfm_tfm_stack load_tfm_stack(const model_ctx & m, const std::string & pfx
 }
 
 static ggml_tensor * apply_tfm_stack(ggml_context * ctx, const cfm_tfm_stack & s,
-                                     ggml_tensor * x, int T, int C, bool f16_kv_attn) {
+                                     ggml_tensor * x, int T, int C, bool f16_kv_attn, bool f16_qkv_attn) {
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
-    for (const auto & b : s.blocks) xt = basic_tfm(ctx, b, xt, T, C, f16_kv_attn);
+    for (const auto & b : s.blocks) xt = basic_tfm(ctx, b, xt, T, C, f16_kv_attn, f16_qkv_attn);
     return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
 }
 
@@ -793,7 +804,8 @@ static std::vector<float> cfm_estimator_forward(
     const std::vector<float> & spks,
     const std::vector<float> & cond,
     int T,
-    bool f16_kv_attn) {
+    bool f16_kv_attn,
+    bool f16_qkv_attn) {
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
 
@@ -830,7 +842,7 @@ static std::vector<float> cfm_estimator_forward(
     ggml_tensor * down_conv_b = find_tensor(m, "cfm/down_blocks/0/2/bias");
 
     ggml_tensor * z = cfm_resnet(ctx, down_rn, xc, t_emb_in, CH);
-    z = apply_tfm_stack(ctx, down_tfms, z, T, CH, f16_kv_attn);
+    z = apply_tfm_stack(ctx, down_tfms, z, T, CH, f16_kv_attn, f16_qkv_attn);
     ggml_tensor * hidden = z;
     z = cfm_causal_k3(ctx, z, down_conv_w, down_conv_b, CH);
 
@@ -838,7 +850,7 @@ static std::vector<float> cfm_estimator_forward(
         auto rn = load_cfm_resnet(m, "cfm/mid_blocks/" + std::to_string(i) + "/0");
         auto tfms = load_tfm_stack(m, "cfm/mid_blocks/" + std::to_string(i) + "/1", N_BLOCKS);
         z = cfm_resnet(ctx, rn, z, t_emb_in, CH);
-        z = apply_tfm_stack(ctx, tfms, z, T, CH, f16_kv_attn);
+        z = apply_tfm_stack(ctx, tfms, z, T, CH, f16_kv_attn, f16_qkv_attn);
     }
 
     auto up_rn = load_cfm_resnet(m, "cfm/up_blocks/0/0");
@@ -847,7 +859,7 @@ static std::vector<float> cfm_estimator_forward(
     ggml_tensor * up_conv_b = find_tensor(m, "cfm/up_blocks/0/2/bias");
     z = ggml_concat(ctx, z, hidden, 1);
     z = cfm_resnet(ctx, up_rn, z, t_emb_in, CH);
-    z = apply_tfm_stack(ctx, up_tfms, z, T, CH, f16_kv_attn);
+    z = apply_tfm_stack(ctx, up_tfms, z, T, CH, f16_kv_attn, f16_qkv_attn);
     z = cfm_causal_k3(ctx, z, up_conv_w, up_conv_b, CH);
 
     ggml_tensor * fb_conv_w = find_tensor(m, "cfm/final_block/block/0/weight");
@@ -1712,7 +1724,9 @@ int s3gen_synthesize_to_wav(
         }
 
         double step_t0 = now_ms();
-        auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, opts.cfm_f16_kv_attn);
+        auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu,
+                                          opts.cfm_f16_kv_attn || opts.cfm_f16_qkv_attn,
+                                          opts.cfm_f16_qkv_attn);
         vlog("  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
 
         if (debug_mode) {

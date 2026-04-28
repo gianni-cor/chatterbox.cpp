@@ -160,6 +160,9 @@ struct s3gen_synthesize_opts {
     // Experimental OpenCL/mobile latency option: run CFM flash attention with
     // F32 Q and F16 K/V.  This may trade a small amount of quality for speed.
     bool                 cfm_f16_kv_attn       = false;
+    // More aggressive variant: run CFM flash attention with F16 Q/K/V and
+    // convert the attention output back to F32 for the following projection.
+    bool                 cfm_f16_qkv_attn      = false;
 };
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.
