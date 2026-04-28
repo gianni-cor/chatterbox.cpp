@@ -2209,7 +2209,7 @@ T3 `Q4_0` + S3Gen `Q4_0`, short `"Hello"` smoke test (800 ms audio),
 | Q4_0 GEMM tile BM=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BM=64 to BM=32 while keeping BN=64/BK=32. | Regression: CFM Q4_0 GEMM grew to ~213 ms and `cfm_total` ~445 ms. Revert to BM=64. |
 | Q4_0 GEMM thread tile TN=4 | Changed per-thread output from TM=4/TN=8 to TM=4/TN=4, keeping BM=64/BN=64/BK=32. | Mild regression: CFM Q4_0 GEMM rose to ~147 ms and `cfm_total` ~411 ms. Revert to TN=8. |
 | CFM attention F16 Q/K/V | Cast Q/K/V to F16 for `flash_attn_f16`, then copy output back to F32 before projection. | Not better than F16 K/V only: flash attention dropped to ~92 ms, but extra copies raised total CFM to ~369 ms vs ~355 ms. Remove the flag; keep `--cfm-f16-kv-attn`. |
-| Direct conv1d via `CONV_2D` | Experimental `CHATTERBOX_DIRECT_CONV1D=1` path reshapes 1D convs to height-1 `ggml_conv_2d_direct`, bypassing explicit `im2col -> mul_mat`. | Mixed result. Profiling run improved HiFT (`hift_decode` ~169 ms, with `kernel_conv_2d` replacing much im2col/GEMM work), but a non-profile phone-awake sample regressed overall (`S3GEN_INFER_MS` ~845 ms, `cfm_total` ~404 ms). Keep opt-in only, not default. |
+| Direct conv1d via `CONV_2D` | Tested an env-gated path that reshaped 1D convs to height-1 `ggml_conv_2d_direct`, bypassing explicit `im2col -> mul_mat`. | Rejected and removed. Profiling run improved HiFT (`hift_decode` ~169 ms), but a non-profile phone-awake sample regressed overall (`S3GEN_INFER_MS` ~845 ms, `cfm_total` ~404 ms), so the code path was deleted. |
 
 Current measured bottlenecks after the useful attention change:
 
