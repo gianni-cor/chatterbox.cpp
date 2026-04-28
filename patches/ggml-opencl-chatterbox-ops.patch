@@ -38,7 +38,7 @@ index 540942b1..d9f93004 100644
      flash_attn_f16
      flash_attn_f32
 diff --git a/src/ggml-opencl/ggml-opencl.cpp b/src/ggml-opencl/ggml-opencl.cpp
-index 6f3fc588..80aacdbf 100644
+index 6f3fc588..2604869f 100644
 --- a/src/ggml-opencl/ggml-opencl.cpp
 +++ b/src/ggml-opencl/ggml-opencl.cpp
 @@ -28,6 +28,7 @@
@@ -1099,6 +1099,15 @@ index 6f3fc588..80aacdbf 100644
                  // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                  size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
                  size_t local_work_size[] = {(size_t)nth0, 1, 1};
+@@ -10759,7 +11559,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 }
+ 
+                 kernel = backend_ctx->kernel_mul_mm_q4_0_f32_l4_lm;
+-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
++                nth0 = 256; // calculated as (BM*BN)/(TM*TN)
+ 
+                 int batch_stride_a = ne00*ne01;
+                 int batch_stride_b = ne10*ne11;
 @@ -10784,6 +11584,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                  CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                  CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
@@ -1713,9 +1722,18 @@ index 00000000..a1ebf57f
 +    dst[get_global_id(0)] = mish_f32_4(src0[get_global_id(0)]);
 +}
 diff --git a/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl b/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
-index 4100e308..394fc1e0 100644
+index 4100e308..d212b400 100644
 --- a/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
 +++ b/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
+@@ -7,7 +7,7 @@
+ #define BN 64
+ #define BK 32
+ #define TM 4
+-#define TN 8
++#define TN 4
+ 
+ kernel void kernel_mul_mm_q4_0_f32_l4_lm(
+     global uchar4 * src0_q,
 @@ -32,7 +32,13 @@ kernel void kernel_mul_mm_q4_0_f32_l4_lm(
      int batch_stride_d,
  
