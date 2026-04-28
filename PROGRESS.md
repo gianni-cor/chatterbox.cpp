@@ -2190,3 +2190,29 @@ Full generated-audio RTF on the short "Hello" smoke test:
 The 1-step mode is deliberately opt-in because it trades some meanflow
 quality for latency; it is useful for interactive/mobile experiments where
 CFM dominates the wall clock.
+
+### OpenCL optimization log (Adreno 830)
+
+Baseline for this log: Termux phone held awake with `termux-wake-lock`,
+T3 `Q4_0` + S3Gen `Q4_0`, short `"Hello"` smoke test (800 ms audio),
+`--n-gpu-layers 99 --cfm-steps 1` unless otherwise noted.
+
+| Step | Change | Result |
+|------|--------|--------|
+| CFM attention precision | Added `--cfm-f16-kv-attn`: CFM flash attention uses F32 Q and F16 K/V so OpenCL dispatches `flash_attn_f32_f16`. | Best useful CFM win so far: attention kernel went from ~257 ms (`flash_attn_f32`) to ~102 ms; S3Gen dropped to ~726-740 ms; full RTF ~1.38-1.39 in best phone-awake samples. |
+| Model mix: S3Gen F16 | T3 Q4_0 + S3Gen full/F16-ish GGUF with `--cfm-f16-kv-attn`. | Not better overall: CFM ~346-354 ms, S3Gen ~743-749 ms. |
+| Model mix: S3Gen Q8_0 | Quantized S3Gen to Q8_0 and tested with T3 Q4_0. | Worse than S3Gen Q4_0: CFM ~391 ms, S3Gen ~789 ms. |
+| Q4_0 GEMV epilogue fusion | Added optional bias/residual epilogue operands to Adreno token GEMV and graph fusion for `MUL_MAT+ADD(+ADD)`. | Correct, but only a tiny T3/S3Gen movement on the short run; not a major bottleneck. |
+| Batched Q4_0 GEMM epilogue fusion | Added optional bias/residual epilogue to `kernel_mul_mm_q4_0_f32_l4_lm`, targeting CFM projection GEMMs. | Correct after arg-placement fix, but core GEMM time stayed ~138 ms in the CFM graph, so surrounding adds were not the real cost. |
+| Q4_0 GEMM tile BN=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BN=64 to BN=32 for the hot `256 x 540` CFM output shape. | Regression: CFM Q4_0 GEMM grew from ~138 ms to ~181 ms. Reverted to the original 64x64 tile. |
+
+Current measured bottlenecks after the useful attention change:
+
+```text
+CFM graph (cl_profiling_0022.csv):
+kernel_mul_mm_q4_0_f32_l4_lm  ~138 ms
+flash_attn_f32_f16            ~102 ms
+```
+
+Next experiments should target the core Q4_0 batched GEMM math itself
+(`kernel_mul_mm_q4_0_f32_l4_lm`), not epilogue/add fusion.
