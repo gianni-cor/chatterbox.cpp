@@ -1713,9 +1713,18 @@ index 00000000..a1ebf57f
 +    dst[get_global_id(0)] = mish_f32_4(src0[get_global_id(0)]);
 +}
 diff --git a/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl b/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
-index 4100e308..394fc1e0 100644
+index 4100e308..0592f625 100644
 --- a/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
 +++ b/src/ggml-opencl/kernels/mul_mm_q4_0_f32_l4_lm.cl
+@@ -5,7 +5,7 @@
+ 
+ #define BM 64
+ #define BN 64
+-#define BK 32
++#define BK 64
+ #define TM 4
+ #define TN 8
+ 
 @@ -32,7 +32,13 @@ kernel void kernel_mul_mm_q4_0_f32_l4_lm(
      int batch_stride_d,
  
